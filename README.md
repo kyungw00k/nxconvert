@@ -22,12 +22,35 @@ Keys are read at runtime only — never embedded in the binary, never written to
 
 ## How it works
 
+Conversion repacks the NCAs between containers — no re-signing, the payload never changes:
+
+```mermaid
+flowchart LR
+    subgraph NSP["NSP — PFS0 container"]
+        direction TB
+        n1["tik / cert"]
+        n2["program.nca"]
+        n3["control / cnmt.nca"]
+    end
+    subgraph XCI["XCI — GAMECARD + HFS0"]
+        direction TB
+        x0["header zone (0xF000)"]
+        x1["update partition (empty)"]
+        x2["normal partition (empty)"]
+        x3["secure partition — NCAs"]
+    end
+    NSP -- "to-xci<br/>(streaming repack)" --> XCI
+    XCI -- "to-nsp<br/>(extract secure → PFS0)" --> NSP
 ```
-NSP = PFS0 container          XCI = GAMECARD header + HFS0 (update/normal/secure)
-        └────────── the NCAs inside are the same payload ──────────┘
-conversion = repack NCAs between containers (no re-signing)
---keys = decrypt NCA header [0x200,0x400) with header_key (AES-XTS) →
-         flip distribution at +0x04 → re-encrypt (content hashes unaffected)
+
+With `--keys`, each NCA header is additionally rewritten for the target distribution:
+
+```mermaid
+flowchart LR
+    A["encrypted NCA header<br/>[0x200, 0x400)"] -- "AES-XTS decrypt<br/>(header_key)" --> B["plaintext header<br/>magic NCA3"]
+    B -- "flip +0x04<br/>0x01 gamecard ⇄ 0x00 CDN" --> C["modified header"]
+    C -- "AES-XTS encrypt" --> D["rewritten NCA header"]
+    D -. "content hashes &amp; cnmt unaffected<br/>(they cover the body only)" .-> E["done"]
 ```
 
 ## Validation (real cartridge dump, 2026-09)
