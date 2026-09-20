@@ -26,32 +26,35 @@ Conversion repacks the NCAs between containers — no re-signing, the payload ne
 
 ```mermaid
 flowchart LR
-    subgraph NSP["NSP — PFS0 container"]
-        direction TB
-        n1["tik / cert"]
-        n2["program.nca"]
-        n3["control / cnmt.nca"]
-    end
-    subgraph XCI["XCI — GAMECARD + HFS0"]
-        direction TB
-        x0["header zone (0xF000)"]
-        x1["update partition (empty)"]
-        x2["normal partition (empty)"]
-        x3["secure partition — NCAs"]
-    end
-    NSP -- "to-xci<br/>(streaming repack)" --> XCI
-    XCI -- "to-nsp<br/>(extract secure → PFS0)" --> NSP
+    NSP["NSP file<br/>PFS0 container"]
+    XCI["XCI file<br/>GAMECARD header<br/>+ HFS0 partitions"]
+    NCAS["NCA files<br/>the actual game"]
+
+    NSP -- "to-xci" --> XCI
+    XCI -- "to-nsp" --> NSP
+    NCAS -.-> NSP
+    NCAS -.-> XCI
+
+    style NSP fill:#dbeafe,stroke:#3b82f6,color:#1e3a5f
+    style XCI fill:#dcfce7,stroke:#22c55e,color:#14532d
+    style NCAS fill:#fef9c3,stroke:#eab308,color:#713f12
 ```
 
 With `--keys`, each NCA header is additionally rewritten for the target distribution:
 
 ```mermaid
 flowchart LR
-    A["encrypted NCA header<br/>[0x200, 0x400)"] -- "AES-XTS decrypt<br/>(header_key)" --> B["plaintext header<br/>magic NCA3"]
-    B -- "flip +0x04<br/>0x01 gamecard ⇄ 0x00 CDN" --> C["modified header"]
-    C -- "AES-XTS encrypt" --> D["rewritten NCA header"]
-    D -. "content hashes &amp; cnmt unaffected<br/>(they cover the body only)" .-> E["done"]
+    A["Encrypted header<br/>[0x200, 0x400)"] --> B["Decrypt<br/>AES-XTS · header_key"]
+    B --> C["Flip byte at +0x04<br/>0x01 gamecard ⇄ 0x00 CDN"]
+    C --> D["Re-encrypt"]
+
+    style A fill:#fee2e2,stroke:#ef4444,color:#7f1d1d
+    style B fill:#dbeafe,stroke:#3b82f6,color:#1e3a5f
+    style C fill:#fef9c3,stroke:#eab308,color:#713f12
+    style D fill:#dcfce7,stroke:#22c55e,color:#14532d
 ```
+
+Content hashes and cnmt are unaffected — they cover the NCA body only, never the header.
 
 ## Validation (real cartridge dump, 2026-09)
 
