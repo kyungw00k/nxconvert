@@ -38,12 +38,9 @@ brews:
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
     homepage: "https://github.com/kyungw00k/nxconvert"
     description: "Nintendo Switch game library builder (multi-source collector, SQLite index, HTML export)"
-    # tap 루트의 github_private_release.rb가 정의한 전략으로 API 경유 다운로드.
-    # custom_require는 require_relative "github_private_release"를,
-    # download_strategy는 각 url에 :using =>를 자동 생성한다.
-    download_strategy: GitHubPrivateRepositoryReleaseDownloadStrategy
-    custom_require: github_private_release
-    # private release이므로 설치 시 HOMEBREW_GITHUB_API_TOKEN(읽기 권한) 필요.
+    # Public repo: plain release URLs, no download strategy needed.
+    # The tap itself stays private, so pushing the formula still uses
+    # HOMEBREW_TAP_GITHUB_TOKEN.
 
 release:
   draft: false
