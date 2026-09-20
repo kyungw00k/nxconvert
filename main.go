@@ -4,7 +4,7 @@
 // Usage:
 //
 //	nxconvert to-nsp input.xci [-o output.nsp]
-//	nxconvert to-xci input.nsp [-o output.xci]
+//	nxconvert to-xci input1.nsp [input2.nsp ...] [-o output.xci]
 //
 // Both directions stream one entry at a time; input files are never loaded
 // into memory whole. Progress is written to stderr, one line per entry.
@@ -25,21 +25,30 @@ import (
 
 const usageText = `Usage:
   nxconvert to-nsp input.xci [-o output.nsp]
-  nxconvert to-xci input.nsp [-o output.xci]
+  nxconvert to-xci input1.nsp [input2.nsp ...] [-o output.xci]
+  nxconvert split input.xci [-o output_dir] [--keys prod.keys]
 
 nxconvert converts Nintendo Switch containers by streaming entries between
 the XCI gamecard image and the NSP distribution container:
 
-  to-nsp  Every file of the XCI's secure partition (HFS0) is streamed into a
-          new PFS0 container. All secure-partition files are carried over.
-  to-xci  Every file of the NSP container (including any .tik/.cert) is
-          streamed into the secure partition of a newly built gamecard image.
+  to-nsp  Every file of the XCI/XCZ secure partition (HFS0) is streamed
+          into a new PFS0 container. .ncz entries are decompressed to .nca.
+  to-xci  One or more NSP/NSZ containers: every file (including any
+          .tik/.cert) is streamed into the secure partition of a single
+          newly built gamecard. Entries whose name already appeared in an
+          earlier input are skipped (first input wins; list BASE before
+          UPDATE/DLC). .ncz entries are decompressed to .nca.
           The gamecard header is a synthetic template: a zeroed 0xF000-byte
           header zone with the "HEAD" magic at 0x100, followed by the root
           HFS0 at 0xF000 with empty update/normal partitions.
+  split   The secure partition is regrouped by content: each NCA's title ID
+          (decrypted from its header with header_key) sorts it into the base
+          game, the update, or a DLC group, and every group is written as
+          its own NSP named TYPE_TITLEID.nsp (BASE_/UPD_/DLC_). .tik/.cert/
+          .xml files ride along with their title's group. Needs --keys.
 
-Options (both subcommands):
-  -o path      Output file. Default: the input path with its extension replaced
+Options (all subcommands):
+  -o path      Output file. Default: the first input's path with its extension replaced
            by .nsp (to-nsp) or .xci (to-xci). An existing output file is
            never overwritten; a failed conversion removes its partial output.
   --keys path Optional prod.keys file. When given, the NCA distribution byte
@@ -66,6 +75,8 @@ func run(args []string) error {
 		return convertToNSP(args[1:])
 	case "to-xci":
 		return convertToXCI(args[1:])
+	case "split":
+		return splitXCI(args[1:])
 	case "help", "-h", "--help":
 		fmt.Print(usageText)
 		return nil
@@ -110,9 +121,8 @@ func convertToNSP(args []string) error {
 	}
 	defer in.Close()
 
-	// Walk the gamecard header to the secure partition. ParseXCI reports the
-	// secure partition's data-area base directly, so entry offsets are added
-	// to it as-is.
+	// Walk the gamecard header to the secure partition (works for both
+	// .xci and .xcz — the container structure is identical).
 	secure, secureBase, err := nxformat.ParseXCI(in)
 	if err != nil {
 		return fmt.Errorf("parse %s as XCI: %w", inPath, err)
@@ -140,6 +150,17 @@ func convertToNSP(args []string) error {
 		}
 	}
 
+	// Decompress .ncz entries (XCZ input)
+	var cleanup func()
+	if hasSuffix(inPath, ".xcz") {
+		var err error
+		cleanup, err = decompressNCZEntries(files, in)
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+	}
+
 	fmt.Fprintf(os.Stderr, "to-nsp: %s -> %s (%d files, %.1f MB)\n", inPath, outPath, len(files), megaBytes(total))
 	headerKey, err := loadHeaderKey(*keysFlag)
 	if err != nil {
@@ -157,59 +178,87 @@ func convertToNSP(args []string) error {
 	return nil
 }
 
-// convertToXCI streams every file of an NSP container into the secure
-// partition of a newly built gamecard (XCI) image.
+// convertToXCI streams every file of one or more NSP containers into the
+// secure partition of a newly built gamecard (XCI) image. Inputs are merged
+// in the given order; entries whose name already appeared in an earlier
+// input are skipped, so a BASE NSP listed before an UPDATE NSP keeps its
+// copy of shared meta files.
 func convertToXCI(args []string) error {
 	fs := flag.NewFlagSet("to-xci", flag.ExitOnError)
-	outFlag := fs.String("o", "", "output XCI path (default: input path with `.xci`)")
+	outFlag := fs.String("o", "", "output XCI path (default: first input path with `.xci`)")
 	keysFlag := fs.String("keys", "", "prod.keys path (enables NCA distribution rewrite)")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: nxconvert to-xci input.nsp [-o output.xci]")
+		fmt.Fprintln(os.Stderr, "Usage: nxconvert to-xci input1.nsp [input2.nsp ...] [-o output.xci]")
 		fmt.Fprintln(os.Stderr, "Run 'nxconvert help' for full usage.")
 	}
 	if err := fs.Parse(permuteFlags(args)); err != nil {
 		return err
 	}
-	if fs.NArg() != 1 {
+	if fs.NArg() < 1 {
 		fs.Usage()
 		os.Exit(2)
 	}
-	inPath := fs.Arg(0)
-	outPath, err := resolveOutput(inPath, *outFlag, ".xci")
+	if fs.Arg(0) == "help" || fs.Arg(0) == "-h" || fs.Arg(0) == "--help" {
+		fs.Usage()
+		return nil
+	}
+	inPaths := fs.Args()
+	outPath, err := resolveOutput(inPaths[0], *outFlag, ".xci")
 	if err != nil {
 		return err
 	}
-
-	in, err := os.Open(inPath)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-
-	entries, headerSize, err := nxformat.ParsePFS0(in)
-	if err != nil {
-		return fmt.Errorf("parse %s as NSP: %w", inPath, err)
-	}
-	if len(entries) == 0 {
-		return fmt.Errorf("%s: container holds no files", inPath)
+	for _, inPath := range inPaths {
+		if outPath == inPath {
+			return fmt.Errorf("output path %s would overwrite the input; pass -o to choose another path", outPath)
+		}
 	}
 
-	st, err := in.Stat()
-	if err != nil {
-		return err
-	}
-	files := make([]nxformat.NamedReader, len(entries))
+	var files []nxformat.NamedReader
+	seen := make(map[string]bool)
 	var total int64
-	for i, e := range entries {
-		if headerSize+e.Offset+e.Size > st.Size() {
-			return fmt.Errorf("%s: entry %s extends past end of file (truncated input?)", inPath, e.Name)
+	for _, inPath := range inPaths {
+		in, err := os.Open(inPath)
+		if err != nil {
+			return err
 		}
-		total += e.Size
-		files[i] = nxformat.NamedReader{
-			Name: e.Name,
-			Size: e.Size,
-			R:    newProgressReader(e.Name, e.Size, nxformat.ReadPFS0File(in, e)),
+		defer in.Close() // entries stream lazily; every input stays open until the XCI is written
+
+		entries, headerSize, err := nxformat.ParsePFS0(in)
+		if err != nil {
+			return fmt.Errorf("parse %s as NSP/NSZ: %w", inPath, err)
 		}
+		if len(entries) == 0 {
+			return fmt.Errorf("%s: container holds no files", inPath)
+		}
+
+		st, err := in.Stat()
+		if err != nil {
+			return err
+		}
+		var inTotal int64
+		var dups int
+		for _, e := range entries {
+			if headerSize+e.Offset+e.Size > st.Size() {
+				return fmt.Errorf("%s: entry %s extends past end of file (truncated input?)", inPath, e.Name)
+			}
+			if seen[e.Name] {
+				dups++
+				continue
+			}
+			seen[e.Name] = true
+			inTotal += e.Size
+			files = append(files, nxformat.NamedReader{
+				Name: e.Name,
+				Size: e.Size,
+				R:    newProgressReader(e.Name, e.Size, nxformat.ReadPFS0File(in, e)),
+			})
+		}
+		total += inTotal
+		fmt.Fprintf(os.Stderr, "  %s: %d files", inPath, len(entries)-dups)
+		if dups > 0 {
+			fmt.Fprintf(os.Stderr, ", %d duplicate(s) skipped", dups)
+		}
+		fmt.Fprintf(os.Stderr, ", %.1f MB\n", megaBytes(inTotal))
 	}
 
 	headerKey, err := loadHeaderKey(*keysFlag)
@@ -219,7 +268,16 @@ func convertToXCI(args []string) error {
 	if err := patchNCADistribution(files, headerKey, nxformat.DistributionGamecard); err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "to-xci: %s -> %s (%d files, %.1f MB)\n", inPath, outPath, len(files), megaBytes(total))
+	// Decompress .ncz entries (NSZ inputs). Entries from plain NSPs are
+	// skipped by name; the fallback ReaderAt is never needed because PFS0
+	// entry readers are section readers over their own input file.
+	cleanup, err := decompressNCZEntries(files, nil)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	fmt.Fprintf(os.Stderr, "to-xci: %d input(s) -> %s (%d files, %.1f MB)\n", len(inPaths), outPath, len(files), megaBytes(total))
 	if err := writeOutput(outPath, func(w io.Writer) error {
 		return nxformat.WriteXCI(w, gamecardHeaderTemplate(), files)
 	}); err != nil {
@@ -444,4 +502,352 @@ func patchNCADistribution(files []nxformat.NamedReader, headerKey []byte, want b
 		files[i].R = patched
 	}
 	return nil
+}
+
+// decompressNCZEntries finds .ncz entries in the files slice, decompresses
+// each to a temp file (.nca), and replaces the entry. The returned cleanup
+// function removes all temp files and must be called after conversion.
+func decompressNCZEntries(files []nxformat.NamedReader, in io.ReaderAt) (func(), error) {
+	var cleanups []func()
+	for i, f := range files {
+		if !strings.HasSuffix(f.Name, ".ncz") {
+			continue
+		}
+		// Find the entry's position: the NamedReader wraps a SectionReader
+		// created by the caller; we need the raw underlying reader. The
+		// progressReader forwards to it, so extract from there.
+		pr, ok := f.R.(*progressReader)
+		if !ok {
+			continue // not a progressReader — shouldn't happen
+		}
+		sr, ok := pr.r.(io.ReaderAt)
+		if !ok {
+			sr = in // fall back to the whole file
+		}
+		newEntry, cleanup, err := decompressOneNCZ(f.Name, sr, f.Size)
+		if err != nil {
+			for _, c := range cleanups {
+				c()
+			}
+			return nil, err
+		}
+		cleanups = append(cleanups, cleanup)
+		files[i] = newEntry
+		fmt.Fprintf(os.Stderr, "  %s -> %s (%.1f MB -> %.1f MB)\n",
+			f.Name, newEntry.Name, megaBytes(f.Size), megaBytes(newEntry.Size))
+	}
+	return func() {
+		for _, c := range cleanups {
+			c()
+		}
+	}, nil
+}
+
+// decompressOneNCZ decompresses a single .ncz entry to a temp .nca file.
+func decompressOneNCZ(name string, ra io.ReaderAt, entrySize int64) (nxformat.NamedReader, func(), error) {
+	// The .ncz data starts at the entry's offset within the container.
+	// The caller passes the whole file as ReaderAt; we need the entry's
+	// absolute offset. Extract it from the progressReader's wrapped
+	// SectionReader if possible; otherwise assume offset 0 (whole file).
+	// For PFS0 entries the offset is already baked into ReadPFS0File;
+	// for HFS0 it's in secureBase+e.Offset. In both cases the caller
+	// created a SectionReader, so we use it directly.
+	sec := io.NewSectionReader(ra, 0, entrySize)
+
+	sections, _, err := nxformat.ParseNCZHeader(sec)
+	if err != nil {
+		return nxformat.NamedReader{}, nil, fmt.Errorf("%s: %w", name, err)
+	}
+	decompSize := nxformat.DecompressedNCASize(sections)
+
+	tmp, err := os.CreateTemp("", "nxconvert-ncz-*.nca")
+	if err != nil {
+		return nxformat.NamedReader{}, nil, err
+	}
+	tmpName := tmp.Name()
+	if err := nxformat.DecompressNCZ(sec, tmp); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return nxformat.NamedReader{}, nil, fmt.Errorf("%s: decompress: %w", name, err)
+	}
+	tmp.Close()
+
+	f, err := os.Open(tmpName)
+	if err != nil {
+		os.Remove(tmpName)
+		return nxformat.NamedReader{}, nil, err
+	}
+
+	newName := strings.TrimSuffix(name, ".ncz") + ".nca"
+	return nxformat.NamedReader{
+		Name: newName,
+		Size: decompSize,
+		R:    newProgressReader(newName, decompSize, f),
+	}, func() { f.Close(); os.Remove(tmpName) }, nil
+}
+
+func hasSuffix(s, suffix string) bool {
+	return strings.HasSuffix(strings.ToLower(s), suffix)
+}
+
+// splitGroup is one output NSP of a split: the NCAs of one installable
+// title — a family's base game, its update, or a single DLC — plus any
+// ticket/cert/xml files riding along with it.
+type splitGroup struct {
+	kind    string // "BASE", "UPD", or "DLC"
+	titleID uint64 // representative title ID used in the output file name
+	files   []nxformat.NamedReader
+}
+
+// name is the output NSP file name for the group, e.g. BASE_0100AA0000010000.nsp.
+func (g *splitGroup) name() string {
+	return fmt.Sprintf("%s_%016X.nsp", g.kind, g.titleID)
+}
+
+// splitKind classifies a title ID by the low 12 bits of its index, per the
+// retail title-ID layout (verified against MK8D 010015200002{2000,2800,3001}
+// and Dead Cells 0100646009FB{E000,E800,F001}): 0x000 is the base
+// application, 0x800 its update, and anything else add-on content. Base and
+// update share the upper 48 bits (the "family"); a DLC's type nibble is the
+// base's +1, but it stays within the same 48-bit family.
+func splitKind(titleID uint64) string {
+	switch titleID & 0xFFF {
+	case 0x000:
+		return "BASE"
+	case 0x800:
+		return "UPD"
+	default:
+		return "DLC"
+	}
+}
+
+// splitXCI splits an XCI gamecard image into one NSP per installable title:
+// the base game, its update, and each DLC. NCA entries are classified by
+// the title ID read from their decrypted NCA header; .tik/.cert/.xml files
+// ride along with the group of the title ID embedded in their file name.
+func splitXCI(args []string) error {
+	fs := flag.NewFlagSet("split", flag.ExitOnError)
+	outFlag := fs.String("o", "", "output directory (default: directory of the input XCI)")
+	keysFlag := fs.String("keys", "", "prod.keys path (required: header_key decrypts NCA headers to read title IDs)")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: nxconvert split input.xci [-o output_dir] [--keys prod.keys]")
+		fmt.Fprintln(os.Stderr, "Run 'nxconvert help' for full usage.")
+	}
+	if err := fs.Parse(permuteFlags(args)); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		fs.Usage()
+		os.Exit(2)
+	}
+	inPath := fs.Arg(0)
+	outDir := *outFlag
+	if outDir == "" {
+		outDir = filepath.Dir(inPath)
+	}
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return err
+	}
+
+	in, err := os.Open(inPath)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	secure, secureBase, err := nxformat.ParseXCI(in)
+	if err != nil {
+		return fmt.Errorf("parse %s as XCI: %w", inPath, err)
+	}
+	if len(secure) == 0 {
+		return fmt.Errorf("%s: gamecard secure partition holds no files", inPath)
+	}
+
+	// Title IDs are only readable from the encrypted NCA header, so split
+	// cannot run keyless like the plain repacks.
+	headerKey, err := loadHeaderKey(*keysFlag)
+	if err != nil {
+		return err
+	}
+	if headerKey == nil {
+		return fmt.Errorf("split needs the header_key from prod.keys to read NCA title IDs; pass --keys prod.keys")
+	}
+
+	st, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	groups, err := classifySecure(secure, secureBase, st.Size(), in, headerKey)
+	if err != nil {
+		return err
+	}
+
+	for _, g := range groups {
+		// NSP is the download container: rewrite gamecard (0x01) NCAs to
+		// download (0x00) distribution, like to-nsp does.
+		if err := patchNCADistribution(g.files, headerKey, nxformat.DistributionDownload); err != nil {
+			return err
+		}
+		var total int64
+		for _, f := range g.files {
+			total += f.Size
+		}
+		outPath := filepath.Join(outDir, g.name())
+		fmt.Fprintf(os.Stderr, "split: %s [%s] -> %s (%d files, %.1f MB)\n",
+			inPath, g.kind, outPath, len(g.files), megaBytes(total))
+		if err := writeOutput(outPath, func(w io.Writer) error {
+			return nxformat.WritePFS0(w, g.files)
+		}); err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "wrote %s\n", outPath)
+	}
+	return nil
+}
+
+// classifySecure groups the secure-partition entries of an XCI by content
+// type. Each .nca entry's first 0x400 bytes are decrypted with headerKey to
+// read its title ID; the base (index 0x000) and update (index 0x800) NCAs of
+// a title family share a group, while every DLC title ID gets its own group
+// — each DLC carries its own cnmt, and a PFS0 holding several cnmts would
+// not install. Note that update *content* NCAs carry the base application's
+// title ID (only the update cnmt carries base+0x800; observed on retail
+// MK8D and Dead Cells update NSPs), so on a merged base+update image the
+// update's content lands in the BASE group. Non-NCA entries (.tik/.cert/.xml)
+// join the group of the title ID naming them, falling back to the family's
+// BASE group.
+func classifySecure(entries []nxformat.FileEntry, secureBase, fileSize int64, in io.ReaderAt, headerKey []byte) ([]*splitGroup, error) {
+	var groups []*splitGroup
+	byKey := make(map[string]*splitGroup)     // grouping key -> group
+	byTitleID := make(map[uint64]*splitGroup) // every NCA title ID -> its group
+	byFamily := make(map[uint64]*splitGroup)  // title family (upper 48 bits) -> its BASE group
+	byNCAName := make(map[string]*splitGroup) // lowercased NCA name -> its group
+	newGroup := func(titleID uint64) *splitGroup {
+		kind := splitKind(titleID)
+		key := fmt.Sprintf("%012X/%s", titleID>>16, kind)
+		if kind == "DLC" {
+			key = fmt.Sprintf("%016X", titleID)
+		}
+		g := byKey[key]
+		if g == nil {
+			g = &splitGroup{kind: kind, titleID: titleID}
+			byKey[key] = g
+			groups = append(groups, g)
+			family := titleID &^ 0xFFFF
+			if kind == "BASE" && byFamily[family] == nil {
+				byFamily[family] = g
+			}
+		}
+		byTitleID[titleID] = g
+		return g
+	}
+	addFile := func(e nxformat.FileEntry, abs int64, g *splitGroup) {
+		g.files = append(g.files, nxformat.NamedReader{
+			Name: e.Name,
+			Size: e.Size,
+			R:    newProgressReader(e.Name, e.Size, io.NewSectionReader(in, abs, e.Size)),
+		})
+	}
+
+	var rideAlongs []nxformat.FileEntry
+	for _, e := range entries {
+		abs := secureBase + e.Offset
+		if abs+e.Size > fileSize {
+			return nil, fmt.Errorf("entry %s extends past end of file (truncated input?)", e.Name)
+		}
+		if hasSuffix(e.Name, ".ncz") {
+			return nil, fmt.Errorf("%s: compressed XCZ entries are not supported by split; convert with to-nsp first", e.Name)
+		}
+		if !hasSuffix(e.Name, ".nca") {
+			rideAlongs = append(rideAlongs, e)
+			continue
+		}
+		if e.Size < 0x400 {
+			return nil, fmt.Errorf("%s: NCA smaller than an NCA header (%d bytes)", e.Name, e.Size)
+		}
+		var hdr [0x400]byte
+		if _, err := in.ReadAt(hdr[:], abs); err != nil {
+			return nil, fmt.Errorf("%s: read header: %w", e.Name, err)
+		}
+		plain, err := nxformat.DecryptNCAHeader(hdr[:], headerKey)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", e.Name, err)
+		}
+		if magic := string(plain[:4]); magic != "NCA3" && magic != "NCA2" {
+			return nil, fmt.Errorf("%s: decrypted header magic %q — wrong header_key?", e.Name, magic)
+		}
+		titleID := binary.LittleEndian.Uint64(plain[0x10:0x18])
+		g := newGroup(titleID)
+		fmt.Fprintf(os.Stderr, "  %s -> %s\n", e.Name, g.name())
+		addFile(e, abs, g)
+		byNCAName[strings.ToLower(e.Name)] = g
+	}
+	if len(groups) == 0 {
+		return nil, fmt.Errorf("secure partition holds no NCA files")
+	}
+
+	// Tickets and certificates are named after their rights ID, whose
+	// 16-hex-digit prefix is the title ID: route each one to its title's
+	// group, or its family's BASE group. cnmt.xml files are named after
+	// their cnmt NCA ("<id>.cnmt.xml" beside "<id>.cnmt.nca"), so follow
+	// that; anything still unplaced joins the first BASE group.
+	for _, e := range rideAlongs {
+		var g *splitGroup
+		if tid, ok := titleIDFromName(e.Name); ok {
+			if cand := byTitleID[tid]; cand != nil {
+				g = cand
+			} else {
+				g = byFamily[tid&^0xFFFF]
+			}
+		}
+		if g == nil && hasSuffix(e.Name, ".xml") {
+			companion := strings.ToLower(e.Name)
+			companion = strings.TrimSuffix(companion, ".xml") + ".nca"
+			g = byNCAName[companion]
+		}
+		if g == nil {
+			for _, cand := range groups {
+				if cand.kind == "BASE" {
+					g = cand
+					break
+				}
+			}
+		}
+		if g == nil {
+			g = groups[0]
+		}
+		fmt.Fprintf(os.Stderr, "  %s -> %s\n", e.Name, g.name())
+		addFile(e, secureBase+e.Offset, g)
+	}
+	return groups, nil
+}
+
+// titleIDFromName extracts the title ID from a rights-ID-named file:
+// tickets and certificates are named "<titleid><keyrev>.tik"/".cert" and
+// cnmt.xml files "<titleid>.cnmt.xml", so the first 16 characters of the
+// name's stem are the title ID in hex.
+func titleIDFromName(name string) (uint64, bool) {
+	stem := name
+	if i := strings.IndexByte(stem, '.'); i >= 0 {
+		stem = stem[:i]
+	}
+	if len(stem) < 16 {
+		return 0, false
+	}
+	var id uint64
+	for _, c := range []byte(stem[:16]) {
+		var v byte
+		switch {
+		case c >= '0' && c <= '9':
+			v = c - '0'
+		case c >= 'a' && c <= 'f':
+			v = c - 'a' + 10
+		case c >= 'A' && c <= 'F':
+			v = c - 'A' + 10
+		default:
+			return 0, false
+		}
+		id = id<<4 | uint64(v)
+	}
+	return id, id != 0
 }
