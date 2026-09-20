@@ -137,6 +137,7 @@ func convertToNSP(args []string) error {
 	}
 	files := make([]nxformat.NamedReader, len(secure))
 	var total int64
+	tracker := NewProgress(0)
 	for i, e := range secure {
 		abs := secureBase + e.Offset
 		if abs+e.Size > st.Size() {
@@ -146,9 +147,11 @@ func convertToNSP(args []string) error {
 		files[i] = nxformat.NamedReader{
 			Name: e.Name,
 			Size: e.Size,
-			R:    newProgressReader(e.Name, e.Size, io.NewSectionReader(in, abs, e.Size)),
+			R:    newTrackedReader(e.Name, e.Size, io.NewSectionReader(in, abs, e.Size), tracker),
 		}
 	}
+	tracker.SetTotal(total)
+	tui := runProgressTUI(tracker)
 
 	// Decompress .ncz entries (XCZ input)
 	var cleanup func()
@@ -169,9 +172,12 @@ func convertToNSP(args []string) error {
 	if err := patchNCADistribution(files, headerKey, nxformat.DistributionDownload); err != nil {
 		return err
 	}
-	if err := writeOutput(outPath, func(w io.Writer) error {
+	err = writeOutput(outPath, func(w io.Writer) error {
 		return nxformat.WritePFS0(w, files)
-	}); err != nil {
+	})
+	tracker.Finish(err)
+	WaitForDone(tui)
+	if err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "wrote %s\n", outPath)
@@ -268,6 +274,15 @@ func convertToXCI(args []string) error {
 	if err := patchNCADistribution(files, headerKey, nxformat.DistributionGamecard); err != nil {
 		return err
 	}
+	// Set up progress tracking
+	tracker := NewProgress(total)
+	tui := runProgressTUI(tracker)
+	for i := range files {
+		if pr, ok := files[i].R.(*progressReader); ok {
+			pr.tracker = tracker
+		}
+	}
+
 	// Decompress .ncz entries (NSZ inputs). Entries from plain NSPs are
 	// skipped by name; the fallback ReaderAt is never needed because PFS0
 	// entry readers are section readers over their own input file.
@@ -278,9 +293,12 @@ func convertToXCI(args []string) error {
 	defer cleanup()
 
 	fmt.Fprintf(os.Stderr, "to-xci: %d input(s) -> %s (%d files, %.1f MB)\n", len(inPaths), outPath, len(files), megaBytes(total))
-	if err := writeOutput(outPath, func(w io.Writer) error {
+	err = writeOutput(outPath, func(w io.Writer) error {
 		return nxformat.WriteXCI(w, gamecardHeaderTemplate(), files)
-	}); err != nil {
+	})
+	tracker.Finish(err)
+	WaitForDone(tui)
+	if err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "wrote %s\n", outPath)
@@ -403,6 +421,7 @@ type progressReader struct {
 	r        io.Reader
 	n        int64
 	reported bool
+	tracker  *Progress // non-nil = TUI mode, suppress stderr
 }
 
 func newProgressReader(name string, size int64, r io.Reader) *progressReader {
@@ -418,7 +437,10 @@ func newProgressReader(name string, size int64, r io.Reader) *progressReader {
 func (p *progressReader) Read(buf []byte) (int, error) {
 	n, err := p.r.Read(buf)
 	p.n += int64(n)
-	if !p.reported && (err == io.EOF || (p.size > 0 && p.n >= p.size)) {
+	if p.tracker != nil {
+		p.tracker.Add(int64(n))
+		p.tracker.SetFile(p.name)
+	} else if !p.reported && (err == io.EOF || (p.size > 0 && p.n >= p.size)) {
 		p.reported = true
 		fmt.Fprintf(os.Stderr, "  %s (%.1f MB)\n", p.name, megaBytes(p.n))
 	}
@@ -850,4 +872,9 @@ func titleIDFromName(name string) (uint64, bool) {
 		id = id<<4 | uint64(v)
 	}
 	return id, id != 0
+}
+
+// newTrackedReader wraps r with a progressReader connected to a TUI tracker.
+func newTrackedReader(name string, size int64, r io.Reader, tracker *Progress) *progressReader {
+	return &progressReader{name: name, size: size, r: r, tracker: tracker}
 }
