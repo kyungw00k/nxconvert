@@ -1,0 +1,5 @@
+nxconvert
+*.nsp
+*.xci
+*.nca
+.DS_Store

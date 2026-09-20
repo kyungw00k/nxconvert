@@ -1,0 +1,65 @@
+# GoReleaser configuration — go-semantic-release가 hook으로 호출한다.
+# release.yml의 go-semantic-release/action 이 빌드/릴리스/formula push를 위임.
+version: 2
+
+project_name: nxconvert
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+builds:
+  - id: nxconvert
+    binary: nxconvert
+    main: .
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - id: nxconvert
+    name_template: "nxconvert_{{ .Os }}_{{ .Arch }}"
+    format: tar.gz
+
+brews:
+  - repository:
+      owner: kyungw00k
+      name: homebrew-stash
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: "https://github.com/kyungw00k/nxconvert"
+    description: "Nintendo Switch game library builder (multi-source collector, SQLite index, HTML export)"
+    # tap 루트의 github_private_release.rb가 정의한 전략으로 API 경유 다운로드.
+    # custom_require는 require_relative "github_private_release"를,
+    # download_strategy는 각 url에 :using =>를 자동 생성한다.
+    download_strategy: GitHubPrivateRepositoryReleaseDownloadStrategy
+    custom_require: github_private_release
+    # private release이므로 설치 시 HOMEBREW_GITHUB_API_TOKEN(읽기 권한) 필요.
+
+release:
+  draft: false
+  prerelease: auto
+  name_template: "v{{.Version}}"
+  footer: |
+    ## 📦 Downloads
+
+    - **macOS (arm64)**: `nxconvert_darwin_arm64.tar.gz`
+    - **macOS (amd64)**: `nxconvert_darwin_amd64.tar.gz`
+    - **Linux (arm64)**: `nxconvert_linux_arm64.tar.gz`
+    - **Linux (amd64)**: `nxconvert_linux_amd64.tar.gz`
+
+    ## 📋 Full Changelog
+
+    See the [full changelog](https://github.com/kyungw00k/nxconvert/compare/{{ .PreviousTag }}...{{ .Tag }})
+
+changelog:
+  use: github-native
