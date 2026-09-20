@@ -4,7 +4,7 @@ Nintendo Switch container converter. Repacks NSP ↔ XCI losslessly, and — wit
 
 ## Quick start (3 steps)
 
-1. `go build -o nxconvert .` (or `brew install kyungw00k/stash/nxconvert`)
+1. `go build -o nxconvert .` (or `brew install kyungw00k/tap/nxconvert`)
 2. `./nxconvert to-nsp game.xci` — writes `game.nsp` next to the input
 3. `./nxconvert to-xci game.nsp --keys ~/.switch/prod.keys` — distribution rewritten to gamecard mode
 
