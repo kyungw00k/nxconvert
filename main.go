@@ -20,7 +20,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"nxconvert/internal/nxformat"
+	"github.com/kyungw00k/nxconvert/internal/nxformat"
 )
 
 const usageText = `Usage:
