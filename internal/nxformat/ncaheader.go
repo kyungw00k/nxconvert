@@ -76,9 +76,15 @@ const (
 	DistributionDownload  = 0x00
 )
 
-// xtsAES processes one IEEE-1619 XTS data unit. key must be 32 bytes
-// (data key ‖ tweak key); tweak is the data-unit number. The GF(2^128)
-// multiplier is x^128 + x^7 + x^2 + x + 1 (0x87 carry).
+// xtsAES processes one XTS data unit the way Nintendo NCAs do. key must be
+// 32 bytes (data key ‖ tweak key); tweak is the data-unit number, encoded
+// big-endian for the initial tweak block. The GF(2^128) multiplier is
+// x^128 + x^7 + x^2 + x + 1 (0x87) with the tweak treated as a little-
+// endian 128-bit integer: the carry propagates toward byte 15 and the
+// reduction constant lands in byte 0 (verified against retail gamecard and
+// CDN NCA headers — with it, the decrypted ProgramId at +0x10, RightsId,
+// and FsEntry table all read correctly; with the standard IEEE byte order
+// every block past the first of each unit decrypts to garbage).
 func xtsAES(key []byte, tweak uint64, data []byte, decrypt bool) ([]byte, error) {
 	if len(key) != 32 {
 		return nil, fmt.Errorf("xts: key must be 32 bytes, got %d", len(key))
@@ -114,15 +120,15 @@ func xtsAES(key []byte, tweak uint64, data []byte, decrypt bool) ([]byte, error)
 		for j := 0; j < 16; j++ {
 			out[i+j] = y[j] ^ t[j]
 		}
-		// t = t * x in GF(2^128)
-		carry := t[0] >> 7
+		// t = t * x in GF(2^128), little-endian integer convention.
+		carry := t[15] >> 7
 		var next [16]byte
-		for j := 0; j < 15; j++ {
-			next[j] = t[j]<<1 | t[j+1]>>7
+		next[0] = t[0] << 1
+		for j := 1; j < 16; j++ {
+			next[j] = t[j]<<1 | t[j-1]>>7
 		}
-		next[15] = t[15] << 1
 		if carry == 1 {
-			next[15] ^= 0x87
+			next[0] ^= 0x87
 		}
 		t = next
 	}
