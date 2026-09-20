@@ -1,10 +1,10 @@
 name: Release
 
-# conventional commit 기반 자동 semantic 버저닝 (unkyobo 패턴).
-# main 브랜치 푸시 또는 수동 실행 시 go-semantic-release가 커밋 히스토리에서
-# 버전을 결정하고, 새 버전이 필요할 때만 goreleaser 훅으로
-# 빌드/릴리스/homebrew-stash formula push를 수행한다.
-# 변경사항이 없으면 아무 릴리스도 만들지 않는다.
+# Automatic semantic versioning based on conventional commits.
+# On push to main or manual dispatch, go-semantic-release determines the
+# version from commit history and, when a new version is needed, invokes
+# goreleaser to build/release/push the homebrew formula.
+# No release is created when there are no changes.
 on:
   push:
     branches:

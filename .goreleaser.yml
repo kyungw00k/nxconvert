@@ -1,5 +1,5 @@
-# GoReleaser configuration — go-semantic-release가 hook으로 호출한다.
-# release.yml의 go-semantic-release/action 이 빌드/릴리스/formula push를 위임.
+# GoReleaser configuration — invoked by go-semantic-release as a hook.
+# The go-semantic-release/action in release.yml delegates build/release/formula push.
 version: 2
 
 project_name: nxconvert

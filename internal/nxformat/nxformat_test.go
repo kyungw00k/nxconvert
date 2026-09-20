@@ -398,12 +398,12 @@ func TestParseBadMagic(t *testing.T) {
 }
 
 func TestXTSRoundTripAndDistribution(t *testing.T) {
-	// 32바이트 헤더키로 XTS 암복호 왕복 + distribution 플립 왕복.
+	// XTS encrypt/decrypt round-trip with a 32-byte header key + distribution flip round-trip.
 	headerKey := make([]byte, 32)
 	for i := range headerKey {
 		headerKey[i] = byte(i * 7)
 	}
-	// 합성 NCA 헤더: 평문 매직 NCA3 + distribution 0x00
+	// Synthetic NCA header: plaintext magic NCA3 + distribution 0x00
 	plain := make([]byte, NCAHeaderEncSize)
 	copy(plain, "NCA3")
 	plain[NCADistributionOffset] = DistributionDownload
@@ -431,7 +431,7 @@ func TestXTSRoundTripAndDistribution(t *testing.T) {
 	if got2[NCADistributionOffset] != DistributionGamecard {
 		t.Fatalf("flipped distribution = %#x", got2[NCADistributionOffset])
 	}
-	// 다시 플립하면 원본 헤더와 바이트 동일 (멱등성)
+	// Flipping back yields bytes identical to the original header (idempotency)
 	back, changed2, _ := FlipDistribution(flipped, headerKey, DistributionDownload)
 	if !changed2 {
 		t.Fatal("expected second change")
