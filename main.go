@@ -12,6 +12,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
 	"flag"
@@ -920,52 +921,166 @@ func parseHexKey(s string) ([]byte, error) {
 	return b, nil
 }
 
-// reencryptForMIG re-encrypts NCA section keys for MIG gamecard compatibility.
-// The pipeline: decrypt CDN sections → re-encrypt with gamecard titlekey.
-// Currently validates keys and reports; full section re-encryption is
-// implemented in nxformat.ReencryptNCA.
+// reencryptForMIG re-encrypts every NCA in files for MIG gamecard
+// compatibility: sections are AES-CTR decrypted under the CDN-derived
+// section key and re-encrypted under cardTitleKey, the key area is
+// rewritten (slots 0/1/3 get fresh random XTS filler, slot 2 gets the
+// card key), and distribution is flipped to gamecard. Each re-encrypted
+// NCA lands in a temp file that replaces the original NamedReader.
 func reencryptForMIG(files []nxformat.NamedReader, headerKey, cardTitleKey []byte, inPaths []string) error {
-	// Load prod.keys for kaak (section key decrypt)
-	var kaak []byte
-	if kf, err := os.Open(findProdKeys()); err == nil {
-		keys, _ := nxformat.ParseProdKeys(kf)
-		kf.Close()
-		if k, ok := keys["key_area_key_application_02"]; ok {
-			kaak = k
-		}
-	}
-	if kaak == nil {
-		return fmt.Errorf("key_area_key_application_02 not found in prod.keys")
-	}
+	prodKeys := loadAllKeys()
+	kaakCache := map[string][]byte{}
 
-	// Extract CDN section keys from the first .cnmt.nca we find
-	for _, f := range files {
-		if !strings.HasSuffix(f.Name, ".cnmt.nca") || f.Size < 0x400 {
+	for i := range files {
+		name := files[i].Name
+		if !strings.HasSuffix(name, ".nca") && !strings.HasSuffix(name, ".cnmt.nca") {
 			continue
 		}
-		// Read NCA header
-		buf := make([]byte, 0x400)
-		if rs, ok := f.R.(io.ReadSeeker); ok {
-			rs.Seek(0, io.SeekStart)
-			io.ReadFull(rs, buf)
-			rs.Seek(0, io.SeekStart)
-
-			plain, err := nxformat.DecryptNCAHeader(buf, headerKey)
-			if err != nil {
-				return fmt.Errorf("%s: %w", f.Name, err)
-			}
-			keyArea := plain[0x100:0x140]
-			dec, err := nxformat.DecryptKeyArea(keyArea, kaak)
-			if err != nil {
-				return fmt.Errorf("%s key_area: %w", f.Name, err)
-			}
-			fmt.Fprintf(os.Stderr, "  CDN section key (slot2): %x\n", dec[2])
-			fmt.Fprintf(os.Stderr, "  Card titlekey:           %x\n", cardTitleKey)
-			fmt.Fprintf(os.Stderr, "  → sections will be re-encrypted from %x to %x\n", dec[2][:4], cardTitleKey[:4])
-			return nil // found and validated
+		rs, ok := files[i].R.(io.ReadSeeker)
+		if !ok {
+			continue
 		}
+
+		// 1. Read + decrypt NCA header
+		hdr := make([]byte, 0x400)
+		if _, err := rs.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("%s: seek: %w", name, err)
+		}
+		if _, err := io.ReadFull(rs, hdr); err != nil {
+			return fmt.Errorf("%s: header: %w", name, err)
+		}
+		plain, err := nxformat.DecryptNCAHeader(hdr, headerKey)
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		kaakIdx := plain[0x07]
+		cryptoType := plain[0x06]
+		cryptoType2 := plain[0x05]
+
+		// 2. kaak for this NCA's generation
+		kaakName := nxformat.KAAKName(kaakIdx, cryptoType, cryptoType2)
+		kaak, ok := kaakCache[kaakName]
+		if !ok {
+			kaak = prodKeys[kaakName]
+			if kaak == nil {
+				return fmt.Errorf("%s: %s missing from prod.keys", name, kaakName)
+			}
+			kaakCache[kaakName] = kaak
+		}
+
+		// 3. Old section key from key area
+		oldKeys, err := nxformat.DecryptKeyArea(plain[0x100:0x140], kaak)
+		if err != nil {
+			return fmt.Errorf("%s: key area: %w", name, err)
+		}
+		oldKey := oldKeys[nxformat.NCASectionKeySlot]
+
+		// 4. New keys: slot 2 = card titlekey, others = fresh random
+		rnd := make([]byte, 16)
+		newKeys := make([][]byte, 4)
+		for slot := range newKeys {
+			if slot == nxformat.NCASectionKeySlot {
+				newKeys[slot] = cardTitleKey
+			} else {
+				rand.Read(rnd)
+				newKeys[slot] = append([]byte(nil), rnd...)
+			}
+		}
+
+		// 5. Rewrite header: new key area + distribution=0x01
+		newPlain := append([]byte(nil), plain...)
+		newKeyArea, err := nxformat.EncryptKeyArea(newKeys, kaak)
+		if err != nil {
+			return fmt.Errorf("%s: encrypt key area: %w", name, err)
+		}
+		copy(newPlain[0x100:], newKeyArea)
+		newPlain[0x04] = 1 // distribution = gamecard (relative to decrypted region)
+		newHdr := make([]byte, 0x400)
+		copy(newHdr, hdr) // keep the unencrypted first 0x200 bytes
+		if err := nxformat.EncryptNCAHeader(newHdr, newPlain, headerKey); err != nil {
+			return fmt.Errorf("%s: encrypt header: %w", name, err)
+		}
+
+		// 6. Sections to re-encrypt
+		secs := nxformat.ParseNCASections(plain)
+		var offs, sizes []int64
+		for _, sc := range secs {
+			offs = append(offs, sc.Offset)
+			sizes = append(sizes, sc.Size)
+		}
+
+		// 7. Stream: new header + copied gap + re-encrypted sections
+		tmp, err := os.CreateTemp("", "nxmig-*.nca")
+		if err != nil {
+			return err
+		}
+		tmpName := tmp.Name()
+		if _, err := rs.Seek(0, io.SeekStart); err != nil {
+			tmp.Close()
+			os.Remove(tmpName)
+			return fmt.Errorf("%s: rewind: %w", name, err)
+		}
+		if _, err := rs.Seek(0, io.SeekStart); err != nil {
+			tmp.Close()
+			os.Remove(tmpName)
+			return fmt.Errorf("%s: rewind: %w", name, err)
+		}
+		if err := nxformat.ReencryptNCA(rs, tmp, oldKey, cardTitleKey, offs, sizes); err != nil {
+			tmp.Close()
+			os.Remove(tmpName)
+			return fmt.Errorf("%s: sections: %w", name, err)
+		}
+		tmp.Close()
+
+		// Patch the rewritten header into the temp file (ReencryptNCA
+		// copies the original header verbatim; we need the new one).
+		tf, err := os.OpenFile(tmpName, os.O_RDWR, 0)
+		if err != nil {
+			os.Remove(tmpName)
+			return err
+		}
+		if _, err := tf.WriteAt(newHdr, 0); err != nil {
+			tf.Close()
+			os.Remove(tmpName)
+			return fmt.Errorf("%s: header patch: %w", name, err)
+		}
+		tf.Close()
+
+		// 8. Swap in the re-encrypted NCA
+		fh, err := os.Open(tmpName)
+		if err != nil {
+			os.Remove(tmpName)
+			return err
+		}
+		st, _ := fh.Stat()
+		old := files[i]
+		_ = old
+		files[i].R = fh
+		files[i].Size = st.Size()
+		fmt.Fprintf(os.Stderr, "  %s: re-encrypted %d section(s), %d bytes (key %x → %x)\n",
+			name, len(secs), st.Size(), oldKey[:4], cardTitleKey[:4])
 	}
-	return fmt.Errorf("no .cnmt.nca found to extract CDN section keys from")
+	return nil
+}
+
+// loadAllKeys parses prod.keys into a map. Returns an empty map on any
+// failure (callers report missing keys per NCA).
+func loadAllKeys() map[string][]byte {
+	out := map[string][]byte{}
+	path := findProdKeys()
+	if path == "" {
+		return out
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return out
+	}
+	defer f.Close()
+	keys, _ := nxformat.ParseProdKeys(f)
+	for k, v := range keys {
+		out[k] = v
+	}
+	return out
 }
 
 func findProdKeys() string {

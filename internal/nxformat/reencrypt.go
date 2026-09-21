@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sort"
 )
 
 // Key-area layout, verified byte-for-byte against retail Dead Cells
@@ -191,4 +192,59 @@ func sectionCounter(offset int64) []byte {
 	iv := make([]byte, aes.BlockSize)
 	binary.BigEndian.PutUint64(iv[8:], uint64(offset)>>4)
 	return iv
+}
+
+// NCAMediaUnit is the media-unit granularity of NCA section table entries.
+const NCAMediaUnit = 0x200
+
+// NCASection describes one encrypted section span inside an NCA.
+type NCASection struct {
+	Offset int64 // absolute byte offset within the NCA
+	Size   int64 // byte size
+}
+
+// ParseNCASections reads the section entry table from a decrypted NCA
+// header (the 0x200-byte plaintext returned by DecryptNCAHeader) and
+// returns the non-empty sections in ascending offset order. Entry i at
+// header +0x40+i*8 holds u32 media start/end (NOT start/size): for the
+// last section of every retail NCA examined, end*0x200 equals the exact
+// file size. Unused slots carry sentinels such as {1,0} or {0,0}; valid
+// sections require end > start and start >= 2 (a section cannot begin
+// before the 0x400-byte NCA header ends).
+func ParseNCASections(plainHeader []byte) []NCASection {
+	var out []NCASection
+	for i := range 4 {
+		base := 0x40 + i*8
+		start := binary.LittleEndian.Uint32(plainHeader[base:])
+		end := binary.LittleEndian.Uint32(plainHeader[base+4:])
+		if end <= start || start < 2 {
+			continue
+		}
+		out = append(out, NCASection{
+			Offset: int64(start) * NCAMediaUnit,
+			Size:   int64(end-start) * NCAMediaUnit,
+		})
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a].Offset < out[b].Offset })
+	return out
+}
+
+// KAAKName returns the prod.keys key name for the key-area key matching
+// kaakIndex (NCA header +0x07: 0=application, 1=ocean, 2=system) and the
+// master-key generation (crypto type). Generation indexing follows the
+// same convention as DecryptKeyArea callers: master_key_XX where
+// XX = max(crypto_type, crypto_type2) - 1, floored at 0.
+func KAAKName(kaakIndex byte, cryptoType, cryptoType2 byte) string {
+	kind := map[byte]string{0: "application", 1: "ocean", 2: "system"}[kaakIndex]
+	if kind == "" {
+		kind = "application"
+	}
+	gen := cryptoType
+	if cryptoType2 > gen {
+		gen = cryptoType2
+	}
+	if gen > 0 {
+		gen--
+	}
+	return fmt.Sprintf("key_area_key_%s_%02d", kind, gen)
 }
