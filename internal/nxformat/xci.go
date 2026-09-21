@@ -38,6 +38,7 @@ const (
 
 	xciPageSize     = 0x200
 	xciLastPageOff  = 0x118 // u64: index of the last valid page
+	xciRootHashOff  = 0x140 // SHA-256 of the root HFS0 header's first 0x200 bytes
 	secureNameOff   = 0x0E  // "update\0normal\0" precedes "secure" in the root string table
 	secureEntryBase = 0x10 + 2*hfs0EntrySize
 )
@@ -194,6 +195,12 @@ func TransplantXCI(w io.Writer, template io.ReaderAt, tmplSize int64, files []Na
 	put32(rootBuf[eOff+20:], hashed)
 	secHash := sha256.Sum256(secure.header[:hashed])
 	copy(rootBuf[eOff+hfs0HashOff:], secHash[:])
+
+	// The gamecard header carries SHA-256 of the root HFS0 header's
+	// first 0x200 bytes at +0x140 (verified against a retail dump and
+	// NSC_BUILDER's writer). Patching the root invalidates it — recompute.
+	rootHdrHash := sha256.Sum256(rootBuf[:min(rootHeaderSize, hfs0HashPrefix)])
+	copy(hdr[xciRootHashOff:], rootHdrHash[:])
 
 	if _, err := w.Write(hdr); err != nil {
 		return fmt.Errorf("nxformat: writing gamecard header: %w", err)
