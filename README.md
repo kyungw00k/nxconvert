@@ -71,5 +71,6 @@ Details: [docs/converter-validation.md](docs/converter-validation.md)
 
 ## Notes
 
+- **Card-specific data is not included**: Real cartridge dumps contain a certificate, initial data, and titlekey area that are unique to each physical card. These cannot be synthesized from NSP data. Community XCI files (and nxconvert output) exclude them — this is standard practice. If you need them for physical card writing, extract them from a real card dump with a tool like nxdumptool.
 - Use converted files only for personal backups. Cartridge-dump NCAs keep their gamecard titlekey encryption (bytes legitimately differ from CDN releases); installs work in Tinfoil/GoldLeaf/sigpatch environments.
 - NSZ/XCZ (compressed containers) are not supported yet.
