@@ -70,7 +70,9 @@ func TestSplitClassifySecure(t *testing.T) {
 	}
 
 	var xci bytes.Buffer
-	if err := nxformat.WriteXCI(&xci, gamecardHeaderTemplate(), files); err != nil {
+	hdr := [0xF000]byte{}
+	copy(hdr[0x100:], "HEAD")
+	if err := nxformat.WriteXCI(&xci, hdr, files); err != nil {
 		t.Fatal(err)
 	}
 	rd := bytes.NewReader(xci.Bytes())

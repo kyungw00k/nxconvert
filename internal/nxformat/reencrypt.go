@@ -230,10 +230,11 @@ func ParseNCASections(plainHeader []byte) []NCASection {
 }
 
 // KAAKName returns the prod.keys key name for the key-area key matching
-// kaakIndex (NCA header +0x07: 0=application, 1=ocean, 2=system) and the
-// master-key generation (crypto type). Generation indexing follows the
-// same convention as DecryptKeyArea callers: master_key_XX where
-// XX = max(crypto_type, crypto_type2) - 1, floored at 0.
+// kaakIndex (decrypted header +0x07: 0=application, 1=ocean, 2=system)
+// and the master-key generation. The generation is max(crypto_type at
+// +0x06, crypto_type2 at +0x20) minus one, floored at 0 — the crypto_type2
+// offset was verified against retail Dead Cells NCAs via the PFS0 anchor
+// test (the byte at +0x05 is a different, legacy field).
 func KAAKName(kaakIndex byte, cryptoType, cryptoType2 byte) string {
 	kind := map[byte]string{0: "application", 1: "ocean", 2: "system"}[kaakIndex]
 	if kind == "" {

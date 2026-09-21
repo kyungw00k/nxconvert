@@ -12,7 +12,6 @@ package main
 
 import (
 	"bufio"
-	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
 	"flag"
@@ -53,16 +52,14 @@ Options (all subcommands):
   -o path      Output file. Default: the first input's path with its extension replaced
            by .nsp (to-nsp) or .xci (to-xci). An existing output file is
            never overwritten; a failed conversion removes its partial output.
-  --keys path Optional prod.keys file.
-  --card-titlekey hex  32-hex gamecard titlekey. When given (with --keys),
-          NCA section keys are re-derived from this key: sections are
-          decrypted with the CDN-derived key and re-encrypted with the
-          gamecard key, making the XCI usable on MIG flashcarts. When given, the NCA distribution byte
-          is rewritten for the target container (0x01 gamecard for to-xci,
-          0x00 download for to-nsp) using the global header_key; content
-          hashes are unaffected (they exclude the header). Auto-discovered
-          at ~/.switch/prod.keys and ~/switch-prod.keys. The key is read at
-          runtime and never embedded or written to outputs.
+  --keys path Optional prod.keys file (to-xci requires it; auto-discovered
+           at ~/.switch/prod.keys and other standard locations). The key is
+           read at runtime and never embedded or written to outputs.
+  --mig-folder dir   (to-xci) Write a MIG-ready game folder: the XCI (split
+           into 0xFFFF0000-byte parts when over the FAT32 limit) plus the
+           Certificate and Initial Data bins copied from --mig-bins.
+  --mig-bins path    (to-xci) Donor card dump XCI to source the
+           Certificate / Initial Data bins for --mig-folder.
 `
 
 func main() {
@@ -198,10 +195,9 @@ func convertToNSP(args []string) error {
 func convertToXCI(args []string) error {
 	fs := flag.NewFlagSet("to-xci", flag.ExitOnError)
 	outFlag := fs.String("o", "", "output XCI path (default: first input path with `.xci`)")
-	keysFlag := fs.String("keys", "", "prod.keys path (enables NCA distribution rewrite)")
-	cardTitleKeyFlag := fs.String("card-titlekey", "", "32-hex gamecard titlekey for MIG re-encryption (requires --keys)")
-	cardTemplateFlag := fs.String("card-template", "", "real card dump XCI to transplant into (preserves card layout: header, update, logo, normal)")
-	migFolderFlag := fs.String("mig-folder", "", "with --card-template: write a MIG-ready game folder here (copies the donor's Certificate and Initial Data bins alongside the XCI)")
+	keysFlag := fs.String("keys", "", "prod.keys path (default: standard locations)")
+	migFolderFlag := fs.String("mig-folder", "", "write a MIG-ready game folder here (XCI + FAT32 split + Certificate/Initial Data bins)")
+	migBinsFlag := fs.String("mig-bins", "", "donor card dump (XCI path) whose Certificate/Initial Data bins to copy into --mig-folder")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: nxconvert to-xci input1.nsp [input2.nsp ...] [-o output.xci]")
 		fmt.Fprintln(os.Stderr, "Run 'nxconvert help' for full usage.")
@@ -276,34 +272,18 @@ func convertToXCI(args []string) error {
 		fmt.Fprintf(os.Stderr, ", %.1f MB\n", megaBytes(inTotal))
 	}
 
-	headerKey, err := loadHeaderKey(*keysFlag)
-	if err != nil {
-		return err
+	// NSC_BUILDER-style NCA header rewrite for XCI: gamecard-flag logic,
+	// rights-id clearing, and titlekey->key-area slots — the header shape
+	// every MIG-verified NSC conversion carries.
+	keysPath := *keysFlag
+	if keysPath == "" {
+		keysPath = findProdKeys()
 	}
-	if err := patchNCADistribution(files, headerKey, nxformat.DistributionGamecard); err != nil {
-		return err
+	if keysPath == "" {
+		return fmt.Errorf("to-xci requires prod.keys: pass --keys or place it at ~/.switch/prod.keys")
 	}
-	// Gamecard titlekey re-encryption (MIG support)
-	if *cardTitleKeyFlag != "" {
-		if len(*keysFlag) == 0 && *cardTitleKeyFlag != "" {
-			// --card-titlekey given without --keys; try auto-discover
-		}
-		cardTitleKey, err := parseHexKey(*cardTitleKeyFlag)
-		if err != nil {
-			return fmt.Errorf("--card-titlekey: %w (expected 32 hex chars)", err)
-		}
-		// Load prod.keys for CDN key extraction
-		headerKey, err := loadHeaderKey(*keysFlag)
-		if err != nil {
-			return err
-		}
-		if headerKey == nil {
-			return fmt.Errorf("--card-titlekey requires --keys (or prod.keys at a standard path)")
-		}
-		fmt.Fprintf(os.Stderr, "card-titlekey: %x (MIG re-encryption mode)\n", cardTitleKey)
-		if err := reencryptForMIG(files, headerKey, cardTitleKey, inPaths); err != nil {
-			return fmt.Errorf("MIG re-encryption: %w", err)
-		}
+	if err := nscRemasterNCAs(files, keysPath); err != nil {
+		return fmt.Errorf("nsc remaster: %w", err)
 	}
 
 	// Set up progress tracking
@@ -325,73 +305,51 @@ func convertToXCI(args []string) error {
 	defer cleanup()
 
 	fmt.Fprintf(os.Stderr, "to-xci: %d input(s) -> %s (%d files, %.1f MB)\n", len(inPaths), outPath, len(files), megaBytes(total))
-	if *cardTemplateFlag != "" {
-		tf, err := os.Open(*cardTemplateFlag)
-		if err != nil {
-			return fmt.Errorf("--card-template: %w", err)
+
+	if *migFolderFlag != "" {
+		if *migBinsFlag == "" {
+			return fmt.Errorf("--mig-folder requires --mig-bins <donor dump xci> for the Certificate/Initial Data bins")
 		}
-		defer tf.Close()
-		st, err := tf.Stat()
-		if err != nil {
-			return fmt.Errorf("--card-template: %w", err)
+		// Stage the XCI inside a MIG game folder: <folder>/<name>.xci/
+		// with the XCI (split into 00,01,... parts over the FAT32 limit)
+		// plus the card-side crypto bins from the donor dump.
+		base := strings.TrimSuffix(filepath.Base(outPath), ".xci")
+		gameDir := filepath.Join(*migFolderFlag, base+".xci")
+		if err := os.MkdirAll(gameDir, 0o755); err != nil {
+			return fmt.Errorf("--mig-folder: %w", err)
 		}
-		if *migFolderFlag != "" {
-			// Stage the XCI inside a MIG game folder with the donor's
-			// card-side crypto files: <folder>/<name>.xci/{cert,initial-data,xci}.
-			// Images over the FAT32 limit are split into an inner
-			// <name>.xci/ folder holding 00,01,... parts (the layout
-			// retail dumpers and the MIG use for large games).
-			base := strings.TrimSuffix(filepath.Base(outPath), ".xci")
-			gameDir := filepath.Join(*migFolderFlag, base+".xci")
-			if err := os.MkdirAll(gameDir, 0o755); err != nil {
+		tmp, err := os.CreateTemp(*migFolderFlag, ".migtmp-*")
+		if err != nil {
+			return fmt.Errorf("--mig-folder: %w", err)
+		}
+		tmpName := tmp.Name()
+		err = nxformat.WriteXCINSC(tmp, files)
+		tmp.Close()
+		if err == nil {
+			err = splitForMIG(tmpName, gameDir, base+".xci")
+		}
+		os.Remove(tmpName)
+		if err != nil {
+			return fmt.Errorf("--mig-folder: %w", err)
+		}
+		donorDir := filepath.Dir(*migBinsFlag)
+		donorBase := strings.TrimSuffix(filepath.Base(*migBinsFlag), ".xci")
+		for _, suffix := range []string{"Certificate", "Initial Data"} {
+			src := filepath.Join(donorDir, donorBase+" ("+suffix+").bin")
+			dst := filepath.Join(gameDir, base+" ("+suffix+").bin")
+			data, err := os.ReadFile(src)
+			if err != nil {
+				return fmt.Errorf("--mig-bins: donor card file: %w", err)
+			}
+			if err := os.WriteFile(dst, data, 0o644); err != nil {
 				return fmt.Errorf("--mig-folder: %w", err)
 			}
-			tmp, err := os.CreateTemp(*migFolderFlag, ".migtmp-*")
-			if err != nil {
-				return fmt.Errorf("--mig-folder: %w", err)
-			}
-			tmpName := tmp.Name()
-			if err := nxformat.TransplantXCI(tmp, tf, st.Size(), files); err != nil {
-				tmp.Close()
-				os.Remove(tmpName)
-				return err
-			}
-			tmp.Close()
-			if err := splitForMIG(tmpName, gameDir, base+".xci"); err != nil {
-				os.Remove(tmpName)
-				return fmt.Errorf("--mig-folder: split: %w", err)
-			}
-			os.Remove(tmpName)
-			// Copy the donor dump's card-side crypto files — the two the
-			// MIG reads for emulation: the RSA certificate and the
-			// challenge-response Initial Data (whose SHA-256 must keep
-			// matching the header's InitialDataHash at +0x160). Card ID
-			// Set / Card UID are dumper by-products and are not needed.
-			donorDir := filepath.Dir(*cardTemplateFlag)
-			donorBase := strings.TrimSuffix(filepath.Base(*cardTemplateFlag), ".xci")
-			for _, suffix := range []string{"Certificate", "Initial Data"} {
-				src := filepath.Join(donorDir, donorBase+" ("+suffix+").bin")
-				dst := filepath.Join(gameDir, base+" ("+suffix+").bin")
-				data, err := os.ReadFile(src)
-				if err != nil {
-					return fmt.Errorf("--mig-folder: donor card file: %w", err)
-				}
-				if err := os.WriteFile(dst, data, 0o644); err != nil {
-					return fmt.Errorf("--mig-folder: %w", err)
-				}
-			}
-			fmt.Fprintf(os.Stderr, "mig-folder: wrote %s (xci + cert/initial-data from %s)\n", gameDir, donorBase)
-		} else {
-			err = writeOutput(outPath, func(w io.Writer) error {
-				return nxformat.TransplantXCI(w, tf, st.Size(), files)
-			})
-			if err != nil {
-				return err
-			}
 		}
-	} else {
+		fmt.Fprintf(os.Stderr, "mig-folder: wrote %s (bins from %s)\n", gameDir, donorBase)
+	}
+	if *migFolderFlag == "" {
 		err = writeOutput(outPath, func(w io.Writer) error {
-			return nxformat.WriteXCI(w, gamecardHeaderTemplate(), files)
+			return nxformat.WriteXCINSC(w, files)
 		})
 		if err != nil {
 			return err
@@ -404,30 +362,6 @@ func convertToXCI(args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "wrote %s\n", outPath)
 	return nil
-}
-
-// gamecardHeaderTemplate returns the fixed 0xF000-byte gamecard header zone
-// that precedes the root HFS0 partition of an XCI, following the layout
-// observed on retail dumps (verified against the crysis sample header):
-//
-//   - 0x0000..0x00FF: RSA-2048 signature area. Real dumps carry per-card
-//     garbage here; a zeroed area is accepted for conversion output.
-//   - 0x0100: "HEAD" magic starting the gamecard header body, plus the
-//     constant fields retail images share: u8 @0x104 = 0x7b, u32 @0x108 =
-//     0xFFFFFFFF, u32 @0x130 = 0xF000 (the root HFS0 offset).
-//     Per-card fields (package id etc.) stay zeroed.
-//   - 0xF000: root HFS0 partition, written by nxformat.WriteXCI with the
-//     empty "update"/"normal" partitions (0x200-byte bare HFS0 headers) and
-//     the "secure" partition carrying the converted files. WriteXCI also
-//     patches the last-valid-data-page field (u64 @0x118) into this
-//     template based on the final output size.
-func gamecardHeaderTemplate() [0xF000]byte {
-	var h [0xF000]byte
-	copy(h[0x100:], "HEAD")
-	h[0x104] = 0x7b
-	binary.LittleEndian.PutUint32(h[0x108:0x10C], 0xFFFFFFFF)
-	binary.LittleEndian.PutUint32(h[0x130:0x134], 0xF000)
-	return h
 }
 
 // resolveOutput picks the output path: the -o flag value if given, otherwise
@@ -489,7 +423,7 @@ func permuteFlags(args []string) []string {
 		case a == "--":
 			positional = append(positional, args[i+1:]...)
 			return append(flags, positional...)
-		case a == "-o" || a == "--o" || a == "--keys" || a == "--card-titlekey" || a == "--card-template" || a == "--mig-folder":
+		case a == "-o" || a == "--o" || a == "--keys" || a == "--mig-folder" || a == "--mig-bins":
 			flags = append(flags, a)
 			if i+1 < len(args) {
 				i++
@@ -980,158 +914,222 @@ func newTrackedReader(name string, size int64, r io.Reader, tracker *Progress) *
 	return &progressReader{name: name, size: size, r: r, tracker: tracker}
 }
 
-// parseHexKey validates a 32-char hex string and returns 16 bytes.
-func parseHexKey(s string) ([]byte, error) {
-	if len(s) != 32 {
-		return nil, fmt.Errorf("got %d chars, want 32", len(s))
-	}
-	b, err := hex.DecodeString(s)
+// nscRemasterNCAs rewrites every NCA header in files following
+// NSC_BUILDER's XCI conversion recipe (the form MIG flashcarts are
+// verified to accept):
+//
+//  1. gamecard flag: 1 only when the whole batch looks like cartridge
+//     content (every NCA has distribution != 0 or an all-zero key-area
+//     slot 0); eShop batches keep distribution 0x00.
+//  2. rights-id is cleared to zero.
+//  3. NCAs that had a rights-id get all four key-area slots filled with
+//     the titlekey (from the batch's .tik) ECB-encrypted under the
+//     generation-matched key_area_key.
+//
+// NCA filenames are kept verbatim. Each patched NCA is spooled to a temp
+// file and swapped in as the entry reader.
+func nscRemasterNCAs(files []nxformat.NamedReader, keysPath string) error {
+	kf, err := os.Open(keysPath)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return b, nil
-}
+	keys, err := nxformat.ParseProdKeys(kf)
+	kf.Close()
+	if err != nil {
+		return err
+	}
+	headerKey := keys["header_key"]
+	if headerKey == nil {
+		return fmt.Errorf("header_key missing from %s", keysPath)
+	}
 
-// reencryptForMIG re-encrypts every NCA in files for MIG gamecard
-// compatibility: sections are AES-CTR decrypted under the CDN-derived
-// section key and re-encrypted under cardTitleKey, the key area is
-// rewritten (slots 0/1/3 get fresh random XTS filler, slot 2 gets the
-// card key), and distribution is flipped to gamecard. Each re-encrypted
-// NCA lands in a temp file that replaces the original NamedReader.
-func reencryptForMIG(files []nxformat.NamedReader, headerKey, cardTitleKey []byte, inPaths []string) error {
-	prodKeys := loadAllKeys()
-	kaakCache := map[string][]byte{}
-
+	// Tickets: rights-id (hex) -> encrypted titlekey.
+	tickets := map[string][]byte{}
 	for i := range files {
-		name := files[i].Name
-		if !strings.HasSuffix(name, ".nca") && !strings.HasSuffix(name, ".cnmt.nca") {
+		if !strings.HasSuffix(files[i].Name, ".tik") {
 			continue
 		}
 		rs, ok := files[i].R.(io.ReadSeeker)
 		if !ok {
 			continue
 		}
-
-		// 1. Read + decrypt NCA header
-		hdr := make([]byte, 0x400)
-		if _, err := rs.Seek(0, io.SeekStart); err != nil {
-			return fmt.Errorf("%s: seek: %w", name, err)
-		}
-		if _, err := io.ReadFull(rs, hdr); err != nil {
-			return fmt.Errorf("%s: header: %w", name, err)
-		}
-		plain, err := nxformat.DecryptNCAHeader(hdr, headerKey)
+		rs.Seek(0, io.SeekStart)
+		data, err := io.ReadAll(rs)
+		rs.Seek(0, io.SeekStart)
 		if err != nil {
-			return fmt.Errorf("%s: %w", name, err)
+			return err
 		}
-		kaakIdx := plain[0x07]
-		cryptoType := plain[0x06]
-		cryptoType2 := plain[0x05]
+		rightsID, encTK, err := nxformat.ParseTicket(data)
+		if err != nil {
+			continue
+		}
+		tickets[hex.EncodeToString(rightsID)] = encTK
+	}
 
-		// 2. kaak for this NCA's generation
-		kaakName := nxformat.KAAKName(kaakIdx, cryptoType, cryptoType2)
-		kaak, ok := kaakCache[kaakName]
+	type info struct {
+		plain     []byte
+		hadRights bool
+		slot0Zero bool
+		gen       byte
+	}
+	infos := make([]*info, len(files))
+	isCartridge := true
+	sawNCA := false
+	for i := range files {
+		if !strings.HasSuffix(files[i].Name, ".nca") {
+			continue
+		}
+		sawNCA = true
+		plain, err := readDecryptHeader(files[i], headerKey)
+		if err != nil {
+			return fmt.Errorf("%s: %w", files[i].Name, err)
+		}
+		kaakName := nxformat.KAAKName(plain[7], plain[6], plain[0x20])
+		kaak := keys[kaakName]
+		if kaak == nil {
+			return fmt.Errorf("%s: %s missing from prod.keys", files[i].Name, kaakName)
+		}
+		ka, err := nxformat.DecryptKeyArea(plain[0x100:0x140], kaak)
+		if err != nil {
+			return fmt.Errorf("%s: key area: %w", files[i].Name, err)
+		}
+		slot0Zero := allZero(ka[0])
+		hadRights := !allZero(plain[0x30:0x40])
+		gen := plain[6]
+		if plain[0x20] > gen {
+			gen = plain[0x20]
+		}
+		infos[i] = &info{plain: plain, hadRights: hadRights, slot0Zero: slot0Zero, gen: gen}
+		if plain[4] == 0 && !slot0Zero {
+			isCartridge = false
+		}
+	}
+	if !sawNCA {
+		return fmt.Errorf("no NCA files found in inputs")
+	}
+
+	for i := range files {
+		if infos[i] == nil {
+			continue
+		}
+		inf := infos[i]
+		plain := append([]byte(nil), inf.plain...)
+
+		gcFlag := byte(0)
+		if isCartridge && (plain[4] != 0 || inf.slot0Zero) {
+			gcFlag = 1
+		}
+		plain[4] = gcFlag
+		rights := append([]byte(nil), plain[0x30:0x40]...)
+		copy(plain[0x30:0x40], make([]byte, 16))
+		if inf.hadRights {
+			encTK, ok := tickets[hex.EncodeToString(rights)]
+			if !ok {
+				return fmt.Errorf("%s: rights id %x has no matching ticket in the batch", files[i].Name, rights)
+			}
+			rev := inf.gen
+			if rev > 0 {
+				rev--
+			}
+			titlekek := keys[fmt.Sprintf("titlekek_%02d", rev)]
+			if titlekek == nil {
+				return fmt.Errorf("%s: titlekek_%02d missing from prod.keys", files[i].Name, rev)
+			}
+			tk, err := decryptTitleKey(encTK, titlekek)
+			if err != nil {
+				return fmt.Errorf("%s: titlekey: %w", files[i].Name, err)
+			}
+			kaak := keys[nxformat.KAAKName(plain[7], plain[6], plain[0x20])]
+			blob, err := nxformat.EncryptKeyArea([][]byte{tk, tk, tk, tk}, kaak)
+			if err != nil {
+				return fmt.Errorf("%s: key area encrypt: %w", files[i].Name, err)
+			}
+			copy(plain[0x100:0x140], blob)
+		}
+
+		// Spool: patched 0x400 header + body verbatim.
+		rs, ok := files[i].R.(io.ReadSeeker)
 		if !ok {
-			kaak = prodKeys[kaakName]
-			if kaak == nil {
-				return fmt.Errorf("%s: %s missing from prod.keys", name, kaakName)
-			}
-			kaakCache[kaakName] = kaak
+			return fmt.Errorf("%s: not seekable", files[i].Name)
 		}
-
-		// 3. Old section key from key area
-		oldKeys, err := nxformat.DecryptKeyArea(plain[0x100:0x140], kaak)
-		if err != nil {
-			return fmt.Errorf("%s: key area: %w", name, err)
+		rs.Seek(0, io.SeekStart)
+		origHdr := make([]byte, 0x400)
+		if _, err := io.ReadFull(rs, origHdr); err != nil {
+			return fmt.Errorf("%s: %w", files[i].Name, err)
 		}
-		oldKey := oldKeys[nxformat.NCASectionKeySlot]
-
-		// 4. New keys: slot 2 = card titlekey, others = fresh random
-		rnd := make([]byte, 16)
-		newKeys := make([][]byte, 4)
-		for slot := range newKeys {
-			if slot == nxformat.NCASectionKeySlot {
-				newKeys[slot] = cardTitleKey
-			} else {
-				rand.Read(rnd)
-				newKeys[slot] = append([]byte(nil), rnd...)
-			}
+		newHdr := append([]byte(nil), origHdr...)
+		if err := nxformat.EncryptNCAHeader(newHdr, plain, headerKey); err != nil {
+			return fmt.Errorf("%s: header encrypt: %w", files[i].Name, err)
 		}
-
-		// 5. Rewrite header: new key area + distribution=0x01
-		newPlain := append([]byte(nil), plain...)
-		newKeyArea, err := nxformat.EncryptKeyArea(newKeys, kaak)
-		if err != nil {
-			return fmt.Errorf("%s: encrypt key area: %w", name, err)
-		}
-		copy(newPlain[0x100:], newKeyArea)
-		newPlain[0x04] = 1 // distribution = gamecard (relative to decrypted region)
-		newHdr := make([]byte, 0x400)
-		copy(newHdr, hdr) // keep the unencrypted first 0x200 bytes
-		if err := nxformat.EncryptNCAHeader(newHdr, newPlain, headerKey); err != nil {
-			return fmt.Errorf("%s: encrypt header: %w", name, err)
-		}
-
-		// 6. Sections to re-encrypt
-		secs := nxformat.ParseNCASections(plain)
-		var offs, sizes []int64
-		for _, sc := range secs {
-			offs = append(offs, sc.Offset)
-			sizes = append(sizes, sc.Size)
-		}
-
-		// 7. Stream: new header + copied gap + re-encrypted sections
-		tmp, err := os.CreateTemp("", "nxmig-*.nca")
+		tmp, err := os.CreateTemp("", "nxnsc-*.nca")
 		if err != nil {
 			return err
 		}
 		tmpName := tmp.Name()
-		if _, err := rs.Seek(0, io.SeekStart); err != nil {
+		if _, err := tmp.Write(newHdr); err != nil {
 			tmp.Close()
-			os.Remove(tmpName)
-			return fmt.Errorf("%s: rewind: %w", name, err)
-		}
-		if _, err := rs.Seek(0, io.SeekStart); err != nil {
-			tmp.Close()
-			os.Remove(tmpName)
-			return fmt.Errorf("%s: rewind: %w", name, err)
-		}
-		if err := nxformat.ReencryptNCA(rs, tmp, oldKey, cardTitleKey, offs, sizes); err != nil {
-			tmp.Close()
-			os.Remove(tmpName)
-			return fmt.Errorf("%s: sections: %w", name, err)
-		}
-		tmp.Close()
-
-		// Patch the rewritten header into the temp file (ReencryptNCA
-		// copies the original header verbatim; we need the new one).
-		tf, err := os.OpenFile(tmpName, os.O_RDWR, 0)
-		if err != nil {
 			os.Remove(tmpName)
 			return err
 		}
-		if _, err := tf.WriteAt(newHdr, 0); err != nil {
-			tf.Close()
+		if _, err := rs.Seek(0x400, io.SeekStart); err != nil {
+			tmp.Close()
 			os.Remove(tmpName)
-			return fmt.Errorf("%s: header patch: %w", name, err)
+			return err
 		}
-		tf.Close()
-
-		// 8. Swap in the re-encrypted NCA
+		if _, err := io.Copy(tmp, rs); err != nil {
+			tmp.Close()
+			os.Remove(tmpName)
+			return fmt.Errorf("%s: %w", files[i].Name, err)
+		}
+		tmp.Close()
 		fh, err := os.Open(tmpName)
 		if err != nil {
 			os.Remove(tmpName)
 			return err
 		}
 		st, _ := fh.Stat()
-		old := files[i]
-		_ = old
 		files[i].R = fh
 		files[i].Size = st.Size()
-		fmt.Fprintf(os.Stderr, "  %s: re-encrypted %d section(s), %d bytes (key %x → %x)\n",
-			name, len(secs), st.Size(), oldKey[:4], cardTitleKey[:4])
+		fmt.Fprintf(os.Stderr, "  %s: gc_flag=%d rights_cleared=%v\n", files[i].Name, gcFlag, inf.hadRights)
 	}
 	return nil
+}
+
+// readDecryptHeader reads an entry's first 0x400 bytes and returns the
+// decrypted 0x200 header region.
+func readDecryptHeader(f nxformat.NamedReader, headerKey []byte) ([]byte, error) {
+	rs, ok := f.R.(io.ReadSeeker)
+	if !ok {
+		return nil, fmt.Errorf("not seekable")
+	}
+	rs.Seek(0, io.SeekStart)
+	hdr := make([]byte, 0x400)
+	if _, err := io.ReadFull(rs, hdr); err != nil {
+		return nil, err
+	}
+	return nxformat.DecryptNCAHeader(hdr, headerKey)
+}
+
+func allZero(b []byte) bool {
+	for _, v := range b {
+		if v != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// decryptTitleKey AES-ECB-decrypts an encrypted titlekey under titlekek
+// (reusing DecryptKeyArea's single-block ECB path).
+func decryptTitleKey(enc, titlekek []byte) ([]byte, error) {
+	if len(enc) != 16 || len(titlekek) != 16 {
+		return nil, fmt.Errorf("bad key length")
+	}
+	keys, err := nxformat.DecryptKeyArea(append([]byte(nil), enc...), titlekek)
+	if err != nil {
+		return nil, err
+	}
+	return keys[0], nil
 }
 
 // loadAllKeys parses prod.keys into a map. Returns an empty map on any
