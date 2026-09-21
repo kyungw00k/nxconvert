@@ -201,6 +201,7 @@ func convertToXCI(args []string) error {
 	keysFlag := fs.String("keys", "", "prod.keys path (enables NCA distribution rewrite)")
 	cardTitleKeyFlag := fs.String("card-titlekey", "", "32-hex gamecard titlekey for MIG re-encryption (requires --keys)")
 	cardTemplateFlag := fs.String("card-template", "", "real card dump XCI to transplant into (preserves card layout: header, update, logo, normal)")
+	migFolderFlag := fs.String("mig-folder", "", "with --card-template: write a MIG-ready game folder here (copies the donor's Certificate and Initial Data bins alongside the XCI)")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: nxconvert to-xci input1.nsp [input2.nsp ...] [-o output.xci]")
 		fmt.Fprintln(os.Stderr, "Run 'nxconvert help' for full usage.")
@@ -334,11 +335,59 @@ func convertToXCI(args []string) error {
 		if err != nil {
 			return fmt.Errorf("--card-template: %w", err)
 		}
-		err = writeOutput(outPath, func(w io.Writer) error {
-			return nxformat.TransplantXCI(w, tf, st.Size(), files)
-		})
-		if err != nil {
-			return err
+		if *migFolderFlag != "" {
+			// Stage the XCI inside a MIG game folder with the donor's
+			// card-side crypto files: <folder>/<name>.xci/{cert,initial-data,xci}.
+			// Images over the FAT32 limit are split into an inner
+			// <name>.xci/ folder holding 00,01,... parts (the layout
+			// retail dumpers and the MIG use for large games).
+			base := strings.TrimSuffix(filepath.Base(outPath), ".xci")
+			gameDir := filepath.Join(*migFolderFlag, base+".xci")
+			if err := os.MkdirAll(gameDir, 0o755); err != nil {
+				return fmt.Errorf("--mig-folder: %w", err)
+			}
+			tmp, err := os.CreateTemp(*migFolderFlag, ".migtmp-*")
+			if err != nil {
+				return fmt.Errorf("--mig-folder: %w", err)
+			}
+			tmpName := tmp.Name()
+			if err := nxformat.TransplantXCI(tmp, tf, st.Size(), files); err != nil {
+				tmp.Close()
+				os.Remove(tmpName)
+				return err
+			}
+			tmp.Close()
+			if err := splitForMIG(tmpName, gameDir, base+".xci"); err != nil {
+				os.Remove(tmpName)
+				return fmt.Errorf("--mig-folder: split: %w", err)
+			}
+			os.Remove(tmpName)
+			// Copy the donor dump's card-side crypto files — the two the
+			// MIG reads for emulation: the RSA certificate and the
+			// challenge-response Initial Data (whose SHA-256 must keep
+			// matching the header's InitialDataHash at +0x160). Card ID
+			// Set / Card UID are dumper by-products and are not needed.
+			donorDir := filepath.Dir(*cardTemplateFlag)
+			donorBase := strings.TrimSuffix(filepath.Base(*cardTemplateFlag), ".xci")
+			for _, suffix := range []string{"Certificate", "Initial Data"} {
+				src := filepath.Join(donorDir, donorBase+" ("+suffix+").bin")
+				dst := filepath.Join(gameDir, base+" ("+suffix+").bin")
+				data, err := os.ReadFile(src)
+				if err != nil {
+					return fmt.Errorf("--mig-folder: donor card file: %w", err)
+				}
+				if err := os.WriteFile(dst, data, 0o644); err != nil {
+					return fmt.Errorf("--mig-folder: %w", err)
+				}
+			}
+			fmt.Fprintf(os.Stderr, "mig-folder: wrote %s (xci + cert/initial-data from %s)\n", gameDir, donorBase)
+		} else {
+			err = writeOutput(outPath, func(w io.Writer) error {
+				return nxformat.TransplantXCI(w, tf, st.Size(), files)
+			})
+			if err != nil {
+				return err
+			}
 		}
 	} else {
 		err = writeOutput(outPath, func(w io.Writer) error {
@@ -440,7 +489,7 @@ func permuteFlags(args []string) []string {
 		case a == "--":
 			positional = append(positional, args[i+1:]...)
 			return append(flags, positional...)
-		case a == "-o" || a == "--o" || a == "--keys" || a == "--card-titlekey" || a == "--card-template":
+		case a == "-o" || a == "--o" || a == "--keys" || a == "--card-titlekey" || a == "--card-template" || a == "--mig-folder":
 			flags = append(flags, a)
 			if i+1 < len(args) {
 				i++
@@ -1121,4 +1170,57 @@ func findProdKeys() string {
 		}
 	}
 	return ""
+}
+
+// migSplitSize is the per-part size retail dumpers use for split XCIs
+// (verified: Mario Kart 8 Deluxe dump part 00 is exactly 0xFFFF0000).
+const migSplitSize = 0xFFFF0000
+
+// splitForMIG lays the image at src into the MIG game folder: a single
+// <name>.xci file when it fits under the FAT32 limit, otherwise an
+// inner <name>.xci/ directory of 00,01,... parts.
+func splitForMIG(src, gameDir, name string) error {
+	st, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	if st.Size() <= migSplitSize {
+		return os.Rename(src, filepath.Join(gameDir, name))
+	}
+	inner := filepath.Join(gameDir, name)
+	if err := os.MkdirAll(inner, 0o755); err != nil {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	part := 0
+	remaining := st.Size()
+	buf := make([]byte, 1<<22)
+	for remaining > 0 {
+		out, err := os.Create(filepath.Join(inner, fmt.Sprintf("%02d", part)))
+		if err != nil {
+			return err
+		}
+		partSize := min(int64(migSplitSize), remaining)
+		for copied := int64(0); copied < partSize; {
+			chunk := min(int64(len(buf)), partSize-copied)
+			read, err := io.ReadFull(in, buf[:chunk])
+			if err != nil {
+				out.Close()
+				return err
+			}
+			if _, err := out.Write(buf[:read]); err != nil {
+				out.Close()
+				return err
+			}
+			copied += int64(read)
+			remaining -= int64(read)
+		}
+		out.Close()
+		part++
+	}
+	return nil
 }

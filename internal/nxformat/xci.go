@@ -183,6 +183,10 @@ func TransplantXCI(w io.Writer, template io.ReaderAt, tmplSize int64, files []Na
 	if total > tmplSize || secure.totalSize != root[secureIdx].Size {
 		binary.LittleEndian.PutUint64(hdr[xciLastPageOff:], uint64((total-1)/xciPageSize))
 	}
+	// Card capacity code must cover the new content (thresholds mirror
+	// NSC_BUILDER's getGCsize: >=4GiB -> 0xE0 8GB card, >=2 -> 0xF0,
+	// >=1 -> 0xF8, else 0xFA). The donor's code fits only donor content.
+	hdr[0x10D] = GamecardSizeCode(total)
 
 	// Patched root: verbatim except the secure entry's size and hash.
 	rootBuf := make([]byte, rootHeaderSize)
@@ -241,4 +245,27 @@ func TransplantXCI(w io.Writer, template io.ReaderAt, tmplSize int64, files []Na
 		}
 	}
 	return nil
+}
+
+// GamecardSizeCode maps a total image size to the RomSize header byte
+// (gamecard header +0x0D), choosing the smallest standard capacity that
+// covers the content. Thresholds mirror NSC_BUILDER's getGCsize.
+func GamecardSizeCode(total int64) byte {
+	const GB = 1 << 30
+	switch {
+	case total >= 32*GB:
+		return 0xE3 // 64GB
+	case total >= 16*GB:
+		return 0xE2 // 32GB
+	case total >= 8*GB:
+		return 0xE1 // 16GB
+	case total >= 4*GB:
+		return 0xE0 // 8GB
+	case total >= 2*GB:
+		return 0xF0 // 4GB
+	case total >= 1*GB:
+		return 0xF8 // 2GB
+	default:
+		return 0xFA // 1GB
+	}
 }
