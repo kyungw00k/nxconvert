@@ -200,6 +200,7 @@ func convertToXCI(args []string) error {
 	outFlag := fs.String("o", "", "output XCI path (default: first input path with `.xci`)")
 	keysFlag := fs.String("keys", "", "prod.keys path (enables NCA distribution rewrite)")
 	cardTitleKeyFlag := fs.String("card-titlekey", "", "32-hex gamecard titlekey for MIG re-encryption (requires --keys)")
+	cardTemplateFlag := fs.String("card-template", "", "real card dump XCI to transplant into (preserves card layout: header, update, logo, normal)")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: nxconvert to-xci input1.nsp [input2.nsp ...] [-o output.xci]")
 		fmt.Fprintln(os.Stderr, "Run 'nxconvert help' for full usage.")
@@ -323,9 +324,30 @@ func convertToXCI(args []string) error {
 	defer cleanup()
 
 	fmt.Fprintf(os.Stderr, "to-xci: %d input(s) -> %s (%d files, %.1f MB)\n", len(inPaths), outPath, len(files), megaBytes(total))
-	err = writeOutput(outPath, func(w io.Writer) error {
-		return nxformat.WriteXCI(w, gamecardHeaderTemplate(), files)
-	})
+	if *cardTemplateFlag != "" {
+		tf, err := os.Open(*cardTemplateFlag)
+		if err != nil {
+			return fmt.Errorf("--card-template: %w", err)
+		}
+		defer tf.Close()
+		st, err := tf.Stat()
+		if err != nil {
+			return fmt.Errorf("--card-template: %w", err)
+		}
+		err = writeOutput(outPath, func(w io.Writer) error {
+			return nxformat.TransplantXCI(w, tf, st.Size(), files)
+		})
+		if err != nil {
+			return err
+		}
+	} else {
+		err = writeOutput(outPath, func(w io.Writer) error {
+			return nxformat.WriteXCI(w, gamecardHeaderTemplate(), files)
+		})
+		if err != nil {
+			return err
+		}
+	}
 	tracker.Finish(err)
 	WaitForDone(tui)
 	if err != nil {
@@ -418,7 +440,7 @@ func permuteFlags(args []string) []string {
 		case a == "--":
 			positional = append(positional, args[i+1:]...)
 			return append(flags, positional...)
-		case a == "-o" || a == "--o" || a == "--keys" || a == "--card-titlekey":
+		case a == "-o" || a == "--o" || a == "--keys" || a == "--card-titlekey" || a == "--card-template":
 			flags = append(flags, a)
 			if i+1 < len(args) {
 				i++

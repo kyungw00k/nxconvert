@@ -138,3 +138,100 @@ func putHFS0Entry(b []byte, off, size int64, nameOff uint32, hashedRegion int64,
 	put32(b[20:], hashedRegion)
 	copy(b[hfs0HashOff:], hash[:])
 }
+
+// TransplantXCI writes an XCI byte-identical to the template gamecard
+// image except for the secure partition, whose files are replaced. The
+// template must be a real card dump: root HFS0 at 0xF000 with
+// update/logo/normal/secure entries and the secure partition sitting at
+// RomAreaStart. Everything before the secure partition — gamecard header,
+// firmware update area, logo, normal — is copied verbatim, so the output
+// preserves the card identity a flashcart or console validates. The
+// root's secure entry gets the new size and header hash; the header's
+// last-valid-page field is recomputed only when the total grows. tmplSize
+// is the template's byte size (used to reproduce the 0xFF tail padding
+// dumps carry past valid data).
+func TransplantXCI(w io.Writer, template io.ReaderAt, tmplSize int64, files []NamedReader) error {
+	root, rootHeaderSize, err := ParseHFS0(template, gamecardRootOffset)
+	if err != nil {
+		return fmt.Errorf("nxformat: template root: %w", err)
+	}
+	secureIdx := -1
+	for i := range root {
+		if root[i].Name == "secure" {
+			secureIdx = i
+			break
+		}
+	}
+	if secureIdx < 0 {
+		return fmt.Errorf("nxformat: template root has no secure entry")
+	}
+	secureBase := gamecardRootOffset + rootHeaderSize + root[secureIdx].Offset
+
+	secure, err := prepareHFS0(files)
+	if err != nil {
+		return err
+	}
+	defer secure.close()
+
+	// Patched gamecard header: verbatim except the last-valid-page field.
+	hdr := make([]byte, gamecardHeaderSize)
+	if _, err := template.ReadAt(hdr, 0); err != nil {
+		return fmt.Errorf("nxformat: reading template header: %w", err)
+	}
+	total := secureBase + secure.totalSize
+	if total > tmplSize || secure.totalSize != root[secureIdx].Size {
+		binary.LittleEndian.PutUint64(hdr[xciLastPageOff:], uint64((total-1)/xciPageSize))
+	}
+
+	// Patched root: verbatim except the secure entry's size and hash.
+	rootBuf := make([]byte, rootHeaderSize)
+	if _, err := template.ReadAt(rootBuf, gamecardRootOffset); err != nil {
+		return fmt.Errorf("nxformat: reading template root: %w", err)
+	}
+	eOff := hfs0HeaderSize + int64(secureIdx)*hfs0EntrySize
+	put64(rootBuf[eOff+8:], secure.totalSize)
+	hashed := min(int64(len(secure.header)), hfs0HashPrefix)
+	put32(rootBuf[eOff+20:], hashed)
+	secHash := sha256.Sum256(secure.header[:hashed])
+	copy(rootBuf[eOff+hfs0HashOff:], secHash[:])
+
+	if _, err := w.Write(hdr); err != nil {
+		return fmt.Errorf("nxformat: writing gamecard header: %w", err)
+	}
+	if _, err := w.Write(rootBuf); err != nil {
+		return fmt.Errorf("nxformat: writing root: %w", err)
+	}
+
+	// Verbatim template span from the end of the root to the secure
+	// partition: firmware update data, logo, normal, and the alignment gap.
+	span := secureBase - (gamecardRootOffset + rootHeaderSize)
+	if span > 0 {
+		if err := copyExact(w, io.NewSectionReader(template, gamecardRootOffset+rootHeaderSize, span), span, "template span"); err != nil {
+			return fmt.Errorf("nxformat: copying template span: %w", err)
+		}
+	}
+
+	if _, err := w.Write(secure.header); err != nil {
+		return fmt.Errorf("nxformat: writing secure header: %w", err)
+	}
+	if err := secure.copyData(w); err != nil {
+		return fmt.Errorf("nxformat: writing secure data: %w", err)
+	}
+
+	// Reproduce the dump's 0xFF tail so the image matches the card size.
+	if tmplSize > total {
+		pad := tmplSize - total
+		buf := make([]byte, 1<<20)
+		for i := range buf {
+			buf[i] = 0xFF
+		}
+		for pad > 0 {
+			n := min(int64(len(buf)), pad)
+			if _, err := w.Write(buf[:n]); err != nil {
+				return fmt.Errorf("nxformat: padding tail: %w", err)
+			}
+			pad -= n
+		}
+	}
+	return nil
+}
