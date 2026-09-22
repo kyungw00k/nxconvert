@@ -1332,8 +1332,15 @@ func patchHeaderForDump(plain []byte, keys map[string][]byte, tickets map[string
 	out = append([]byte(nil), plain...)
 	out[4] = 0x01 // gamecard distribution
 
-	// Fresh random section key — the working card "dumps" carry fresh
-	// per-NCA keys ({0,0,key,0}), never the CDN ones.
+	// Bump the master key generation by one — the working card "dumps"
+	// carry gen+1 vs their CDN source (Dead Cells: CDN gen 4 → card gen 5,
+	// the ONLY field difference in an otherwise identical NCA).
+	if out[0x20] > out[6] {
+		out[6] = out[0x20]
+	}
+	if out[0x20] < out[6]+1 {
+		out[0x20] = out[6] + 1
+	}
 	gen := out[6]
 	if out[0x20] > gen {
 		gen = out[0x20]
