@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"strings"
 )
 
 // XCI (gamecard image) layout, verified byte-exact against a retail dump:
@@ -292,6 +293,16 @@ func GamecardSizeCode(total int64) byte {
 // NCA entries keep their original filenames; each secure entry hash is
 // the SHA-256 of the (patched) NCA's first 0x200 bytes.
 func WriteXCINSC(w io.Writer, files []NamedReader) error {
+	// Retail gamecards carry at least four secure entries; hacbuild-era
+	// converters padded thinner games with zero-length dummies ("0",
+	// "00", ...) to match. Mirror that convention as a safeguard.
+	for len(files) < 4 {
+		files = append(files, NamedReader{
+			Name: fmt.Sprintf("%0*d", len(files), 0),
+			Size: 0,
+			R:    strings.NewReader(""),
+		})
+	}
 	secure, err := prepareHFS0(files)
 	if err != nil {
 		return err
