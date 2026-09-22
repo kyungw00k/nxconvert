@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"sort"
 )
 
 // Key-area layout, verified byte-for-byte against retail Dead Cells
@@ -115,9 +114,9 @@ func DeriveSectionKey(titleKey []byte, kaak []byte) ([][]byte, error) {
 // high half stays zero, matching every non-BKTR retail section; BKTR
 // subsection counters are not modelled. Sections must be listed in
 // ascending, non-overlapping order.
-func ReencryptNCA(r io.ReadSeeker, w io.Writer, oldKey, newKey []byte, sectionOffsets, sectionSizes []int64) error {
-	if len(sectionOffsets) != len(sectionSizes) {
-		return fmt.Errorf("%d section offsets but %d sizes", len(sectionOffsets), len(sectionSizes))
+func ReencryptNCA(r io.ReadSeeker, w io.Writer, oldKey, newKey []byte, sectionIVs [][]byte, sectionOffsets, sectionSizes []int64) error {
+	if len(sectionOffsets) != len(sectionSizes) || len(sectionIVs) != len(sectionOffsets) {
+		return fmt.Errorf("section lists disagree: %d offsets, %d sizes, %d IVs", len(sectionOffsets), len(sectionSizes), len(sectionIVs))
 	}
 	for _, key := range [][]byte{oldKey, newKey} {
 		if len(key) != aes.BlockSize {
@@ -136,7 +135,7 @@ func ReencryptNCA(r io.ReadSeeker, w io.Writer, oldKey, newKey []byte, sectionOf
 		if err := copySpan(w, r, off-pos); err != nil {
 			return err
 		}
-		if err := reencryptSpan(r, w, oldKey, newKey, sectionCounter(off), size); err != nil {
+		if err := reencryptSpan(r, w, oldKey, newKey, sectionIVs[i], size); err != nil {
 			return fmt.Errorf("section %d (%d bytes at %d): %w", i, size, off, err)
 		}
 		pos = off + size
@@ -185,22 +184,15 @@ func reencryptSpan(r io.Reader, w io.Writer, oldKey, newKey, iv []byte, size int
 	return nil
 }
 
-// sectionCounter builds the 16-byte AES-CTR IV for the NCA section at the
-// given absolute byte offset: the offset in 0x10-byte units, big-endian,
-// filling the low half of the block.
-func sectionCounter(offset int64) []byte {
-	iv := make([]byte, aes.BlockSize)
-	binary.BigEndian.PutUint64(iv[8:], uint64(offset)>>4)
-	return iv
-}
-
 // NCAMediaUnit is the media-unit granularity of NCA section table entries.
 const NCAMediaUnit = 0x200
 
 // NCASection describes one encrypted section span inside an NCA.
 type NCASection struct {
-	Offset int64 // absolute byte offset within the NCA
-	Size   int64 // byte size
+	Slot    int   // section-table slot (0..3)
+	Ordinal int   // index among non-empty slots, in slot order — selects fs_header[Ordinal]
+	Offset  int64 // absolute byte offset within the NCA
+	Size    int64 // byte size
 }
 
 // ParseNCASections reads the section entry table from a decrypted NCA
@@ -221,12 +213,27 @@ func ParseNCASections(plainHeader []byte) []NCASection {
 			continue
 		}
 		out = append(out, NCASection{
-			Offset: int64(start) * NCAMediaUnit,
-			Size:   int64(end-start) * NCAMediaUnit,
+			Slot:    i,
+			Ordinal: len(out),
+			Offset:  int64(start) * NCAMediaUnit,
+			Size:    int64(end-start) * NCAMediaUnit,
 		})
 	}
-	sort.Slice(out, func(a, b int) bool { return out[a].Offset < out[b].Offset })
 	return out
+}
+
+// SectionIV builds the full 16-byte AES-CTR IV for a section: the high 8
+// bytes are the fs_header's section_ctr (fs_plain[0x140:0x148]) reversed,
+// the low 8 the absolute offset in 0x10-byte units big-endian. Verified
+// against retail Dead Cells program NCAs via the IVFC master hash and
+// hactoolnet's Section CTR display (exefs sctr=1, romfs sctr=2, cnmt 0).
+func SectionIV(fsPlain []byte, offset int64) []byte {
+	iv := make([]byte, 16)
+	for i := range 8 {
+		iv[i] = fsPlain[0x140+7-i]
+	}
+	binary.BigEndian.PutUint64(iv[8:], uint64(offset)>>4)
+	return iv
 }
 
 // KAAKName returns the prod.keys key name for the key-area key matching

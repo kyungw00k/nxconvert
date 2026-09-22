@@ -12,6 +12,11 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"flag"
@@ -19,6 +24,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/kyungw00k/nxconvert/internal/nxformat"
@@ -199,6 +205,7 @@ func convertToXCI(args []string) error {
 	migFolderFlag := fs.String("mig-folder", "", "write a MIG-ready game folder here (XCI + FAT32 split + Certificate/Initial Data bins)")
 	migBinsFlag := fs.String("mig-bins", "", "donor card dump (XCI path) whose Certificate/Initial Data bins to copy into --mig-folder")
 	noRemasterFlag := fs.Bool("no-remaster", false, "skip NCA header rewriting (no keys needed; emulator-oriented output)")
+	dumpStyleFlag := fs.Bool("dump-style", false, "fully self-consistent remaster: gamecard flags, recomputed NCA ids, repointed cnmt — the dump shape stock consoles accept")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: nxconvert to-xci input1.nsp [input2.nsp ...] [-o output.xci]")
 		fmt.Fprintln(os.Stderr, "Run 'nxconvert help' for full usage.")
@@ -279,7 +286,18 @@ func convertToXCI(args []string) error {
 	// a pure container swap (rights-based NCAs stay untouched; emulators
 	// read the ticket themselves).
 	keysPath := *keysFlag
-	if !*noRemasterFlag {
+	if *dumpStyleFlag {
+		keysPath2 := *keysFlag
+		if keysPath2 == "" {
+			keysPath2 = findProdKeys()
+		}
+		if keysPath2 == "" {
+			return fmt.Errorf("--dump-style requires prod.keys")
+		}
+		if err := remasterDumpStyle(files, keysPath2, "", "", ""); err != nil {
+			return fmt.Errorf("dump-style remaster: %w", err)
+		}
+	} else if !*noRemasterFlag {
 		if keysPath == "" {
 			keysPath = findProdKeys()
 		}
@@ -1158,6 +1176,340 @@ func loadAllKeys() map[string][]byte {
 		out[k] = v
 	}
 	return out
+}
+
+// dumpMeta carries a remastered NCA's new identity.
+type dumpMeta struct {
+	newID   []byte
+	newSHA  []byte
+	content []byte
+}
+
+// remasterDumpStyle rewrites NCAs into a fully self-consistent,
+// dump-shaped form — the recipe stock consoles + MIG flashcarts accept:
+//
+//  1. every NCA: distribution forced to gamecard (0x01); rights-based
+//     NCAs get rights cleared and the titlekey (from the batch .tik)
+//     ECB-encrypted into all four key-area slots.
+//  2. NCA filenames recomputed: <sha256(new content)[:16]>.nca.
+//  3. the cnmt NCA: content entries re-pointed at the new IDs+hashes,
+//     the PFS0 hash table recomputed (0x1000 blocks, final block raw),
+//     the master hash rewritten at fs_header+0x08, the section-header
+//     hash at decrypted-header +0x80 refreshed, then renamed itself.
+//
+// Key chain verified against retail Dead Cells BASE/UPD NCAs.
+func remasterDumpStyle(files []nxformat.NamedReader, keysPath string, donorXCI string, migFolder, gameName string) error {
+	kf, err := os.Open(keysPath)
+	if err != nil {
+		return err
+	}
+	keys, err := nxformat.ParseProdKeys(kf)
+	kf.Close()
+	if err != nil {
+		return err
+	}
+	headerKey := keys["header_key"]
+	if headerKey == nil {
+		return fmt.Errorf("header_key missing")
+	}
+
+	// Tickets.
+	tickets := map[string][]byte{}
+	for i := range files {
+		if !strings.HasSuffix(files[i].Name, ".tik") {
+			continue
+		}
+		rs, ok := files[i].R.(io.ReadSeeker)
+		if !ok {
+			continue
+		}
+		rs.Seek(0, io.SeekStart)
+		data, err := io.ReadAll(rs)
+		rs.Seek(0, io.SeekStart)
+		if err != nil {
+			return err
+		}
+		rightsID, encTK, err := nxformat.ParseTicket(data)
+		if err != nil {
+			continue
+		}
+		tickets[hex.EncodeToString(rightsID)] = encTK
+	}
+
+	rename := map[string]*dumpMeta{} // old name (no ext) -> meta
+
+	// Phase 1: non-cnmt NCAs.
+	var cnmtIdx = -1
+	for i := range files {
+		name := files[i].Name
+		if !strings.HasSuffix(name, ".nca") {
+			continue
+		}
+		if strings.HasSuffix(name, ".cnmt.nca") {
+			if cnmtIdx >= 0 {
+				return fmt.Errorf("multiple cnmt NCAs in batch")
+			}
+			cnmtIdx = i
+			continue
+		}
+		rs, ok := files[i].R.(io.ReadSeeker)
+		if !ok {
+			return fmt.Errorf("%s: not seekable", name)
+		}
+		rs.Seek(0, io.SeekStart)
+		full, err := io.ReadAll(rs)
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		plain, err := nxformat.DecryptNCAHeader(full[:0x400], headerKey)
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		plain, oldKey, newKey, err := patchHeaderForDump(plain, keys, tickets)
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		// 섹션 재암호화: CDN 키 → 새 랜덤 키. IV = fs_header[서수]의
+		// section_ctr 반전 ‖ be64(오프셋>>4) — 실측 규칙 (IVFC 마스터해시로 검증).
+		if !allZero(oldKey) {
+			secs := nxformat.ParseNCASections(plain)
+			type secJob struct {
+				off, size int64
+				iv        []byte
+			}
+			var jobs []secJob
+			for _, sc := range secs {
+				fsRaw := full[0x400+sc.Ordinal*0x200 : 0x600+sc.Ordinal*0x200]
+				fsPlain, err := nxformat.DecryptFSHeader(fsRaw, sc.Ordinal, headerKey)
+				if err != nil {
+					return fmt.Errorf("%s: fs header %d: %w", name, sc.Ordinal, err)
+				}
+				jobs = append(jobs, secJob{sc.Offset, sc.Size, nxformat.SectionIV(fsPlain, sc.Offset)})
+			}
+			sort.Slice(jobs, func(a, b int) bool { return jobs[a].off < jobs[b].off })
+			var offs, sizes []int64
+			var ivs [][]byte
+			for _, j := range jobs {
+				offs = append(offs, j.off)
+				sizes = append(sizes, j.size)
+				ivs = append(ivs, j.iv)
+			}
+			var buf bytes.Buffer
+			buf.Grow(len(full))
+			if err := nxformat.ReencryptNCA(bytes.NewReader(full), &buf, oldKey, newKey, ivs, offs, sizes); err != nil {
+				return fmt.Errorf("%s: reencrypt: %w", name, err)
+			}
+			full = buf.Bytes()
+			fmt.Fprintf(os.Stderr, "  %s: sections re-encrypted under fresh key %x\n", name[:12], newKey[:4])
+		}
+		if err := nxformat.EncryptNCAHeader(full, plain, headerKey); err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		sum := sha256.Sum256(full)
+		id := sum[:16]
+		old := strings.TrimSuffix(name, ".nca")
+		rename[old] = &dumpMeta{newID: id, newSHA: sum[:], content: full}
+		files[i].R = bytes.NewReader(full)
+		files[i].Size = int64(len(full))
+		files[i].Name = hex.EncodeToString(id) + ".nca"
+		fmt.Fprintf(os.Stderr, "  %s -> %s (%d B)\n", old[:12], files[i].Name[:12], len(full))
+	}
+	if cnmtIdx < 0 {
+		return fmt.Errorf("no cnmt NCA in batch")
+	}
+
+	// Phase 2: cnmt NCA.
+	if err := remasterCnmt(files, cnmtIdx, keys, headerKey, rename); err != nil {
+		return err
+	}
+	return nil
+}
+
+// patchHeaderForDump applies dist/rights/key-area edits to a decrypted
+// 0x200 header region. Returns the patched header and the OLD section key
+// (for section re-encryption) plus the NEW random section key.
+func patchHeaderForDump(plain []byte, keys map[string][]byte, tickets map[string][]byte) (out []byte, oldKey, newKey []byte, err error) {
+	out = append([]byte(nil), plain...)
+	out[4] = 0x01 // gamecard distribution
+
+	// Fresh random section key — the working card "dumps" carry fresh
+	// per-NCA keys ({0,0,key,0}), never the CDN ones.
+	gen := out[6]
+	if out[0x20] > gen {
+		gen = out[0x20]
+	}
+	rev := gen
+	if rev > 0 {
+		rev--
+	}
+	kaak := keys[nxformat.KAAKName(out[7], out[6], out[0x20])]
+	if kaak == nil {
+		return nil, nil, nil, fmt.Errorf("%s missing", nxformat.KAAKName(out[7], out[6], out[0x20]))
+	}
+	ka, err2 := nxformat.DecryptKeyArea(out[0x100:0x140], kaak)
+	if err2 != nil {
+		return nil, nil, nil, err2
+	}
+	oldKey = ka[nxformat.NCASectionKeySlot]
+	newKey = make([]byte, 16)
+	rand.Read(newKey)
+	z16 := make([]byte, 16)
+	blob, err2 := nxformat.EncryptKeyArea([][]byte{z16, z16, newKey, z16}, kaak)
+	if err2 != nil {
+		return nil, nil, nil, err2
+	}
+	copy(out[0x100:0x140], blob)
+
+	rights := append([]byte(nil), out[0x30:0x40]...)
+	copy(out[0x30:0x40], make([]byte, 16))
+	if allZero(rights) {
+		return out, oldKey, newKey, nil
+	}
+	encTK, ok := tickets[hex.EncodeToString(rights)]
+	if !ok {
+		return nil, nil, nil, fmt.Errorf("rights id %x has no ticket in batch", rights)
+	}
+	titlekek := keys[fmt.Sprintf("titlekek_%02d", rev)]
+	if titlekek == nil {
+		return nil, nil, nil, fmt.Errorf("titlekek_%02d missing from prod.keys", rev)
+	}
+	tk, err := decryptTitleKey(encTK, titlekek)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	kaak2 := keys[nxformat.KAAKName(out[7], out[6], out[0x20])]
+	if kaak2 == nil {
+		return nil, nil, nil, fmt.Errorf("%s missing", nxformat.KAAKName(out[7], out[6], out[0x20]))
+	}
+	// rights 기반: titlekey를 새 키로 사용
+	blob2, err := nxformat.EncryptKeyArea([][]byte{tk, tk, tk, tk}, kaak2)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	copy(out[0x100:0x140], blob2)
+	return out, oldKey, tk, nil
+}
+
+// remasterCnmt patches the cnmt NCA: content entries, PFS0 hash table,
+// master hash, section hash, then renames it.
+func remasterCnmt(files []nxformat.NamedReader, idx int, keys map[string][]byte, headerKey []byte, rename map[string]*dumpMeta) error {
+	rs, ok := files[idx].R.(io.ReadSeeker)
+	if !ok {
+		return fmt.Errorf("cnmt: not seekable")
+	}
+	rs.Seek(0, io.SeekStart)
+	full, err := io.ReadAll(rs)
+	if err != nil {
+		return err
+	}
+	plain, err := nxformat.DecryptNCAHeader(full[:0x400], headerKey)
+	if err != nil {
+		return err
+	}
+	kaak := keys[nxformat.KAAKName(plain[7], plain[6], plain[0x20])]
+	ka, err := nxformat.DecryptKeyArea(plain[0x100:0x140], kaak)
+	if err != nil {
+		return err
+	}
+	secKey := ka[nxformat.NCASectionKeySlot]
+	secs := nxformat.ParseNCASections(plain)
+	if len(secs) == 0 {
+		return fmt.Errorf("cnmt: no sections")
+	}
+	secOff, secSize := secs[0].Offset, secs[0].Size
+	if secOff+secSize > int64(len(full)) {
+		return fmt.Errorf("cnmt: section beyond file")
+	}
+
+	// Decrypt section.
+	block, _ := aes.NewCipher(secKey)
+	iv := make([]byte, 16)
+	binary.BigEndian.PutUint64(iv[8:], uint64(secOff>>4))
+	secPlain := append([]byte(nil), full[secOff:secOff+secSize]...)
+	cipher.NewCTR(block, iv).XORKeyStream(secPlain, secPlain)
+
+	// fs_header[0] (raw at 0x400).
+	fsRaw := append([]byte(nil), full[0x400:0x600]...)
+	fsPlain, err := nxformat.DecryptFSHeader(fsRaw, 0, headerKey)
+	if err != nil {
+		return err
+	}
+	blockSize := int64(binary.LittleEndian.Uint32(fsPlain[0x28:]))
+	pfs0Off := int64(binary.LittleEndian.Uint64(fsPlain[0x38:]))
+	tableSize := int64(binary.LittleEndian.Uint64(fsPlain[0x40:]))
+	partSize := int64(binary.LittleEndian.Uint64(fsPlain[0x48:]))
+
+	// PFS0: single .cnmt file.
+	nf := binary.LittleEndian.Uint32(secPlain[pfs0Off+4:])
+	ss := binary.LittleEndian.Uint32(secPlain[pfs0Off+8:])
+	fsz := binary.LittleEndian.Uint64(secPlain[pfs0Off+0x18:])
+	dataBase := pfs0Off + 0x10 + int64(nf)*0x18 + int64(ss)
+	cnmtFile := secPlain[dataBase : dataBase+int64(fsz)]
+
+	// Patch content entries: 0x20+table_offset, 0x38 stride.
+	tableOffset := int64(binary.LittleEndian.Uint16(cnmtFile[0x0E:]))
+	count := int64(binary.LittleEndian.Uint16(cnmtFile[0x10:]))
+	entriesOff := 0x20 + tableOffset
+	patched := 0
+	for i := int64(0); i < count; i++ {
+		e := entriesOff + i*0x38
+		if e+0x38 > int64(len(cnmtFile)) {
+			break
+		}
+		oldID := cnmtFile[e+0x20 : e+0x30]
+		meta, ok := rename[hex.EncodeToString(oldID)]
+		if !ok {
+			continue
+		}
+		copy(cnmtFile[e+0x00:e+0x20], meta.newSHA)
+		copy(cnmtFile[e+0x20:e+0x30], meta.newID)
+		patched++
+	}
+	fmt.Fprintf(os.Stderr, "  cnmt: %d/%d content entries repointed\n", patched, count)
+
+	// Recompute hash table: blocks of blockSize over [pfs0Off, pfs0Off+partSize).
+	nblocks := (partSize + blockSize - 1) / blockSize
+	if nblocks*32 != tableSize {
+		return fmt.Errorf("cnmt: table size mismatch (expect %d, have %d)", nblocks*32, tableSize)
+	}
+	for b := int64(0); b < nblocks; b++ {
+		start := pfs0Off + b*blockSize
+		end := min(start+blockSize, pfs0Off+partSize)
+		h := sha256.Sum256(secPlain[start:end])
+		copy(secPlain[b*32:b*32+32], h[:])
+	}
+	master := sha256.Sum256(secPlain[:tableSize])
+	copy(fsPlain[0x08:0x28], master[:])
+
+	// Re-encrypt fs_header + patch +0x80 section hash.
+	newFs, err := nxformat.EncryptFSHeader(fsPlain, 0, headerKey)
+	if err != nil {
+		return err
+	}
+	copy(full[0x400:0x600], newFs)
+	secHash := sha256.Sum256(fsPlain)
+	copy(plain[0x80:0xA0], secHash[:])
+	plain, _, _, err = patchHeaderForDump(plain, keys, map[string][]byte{})
+	if err != nil {
+		return err
+	}
+	if err := nxformat.EncryptNCAHeader(full, plain, headerKey); err != nil {
+		return err
+	}
+
+	// Re-encrypt section.
+	cipher.NewCTR(block, iv).XORKeyStream(secPlain, secPlain)
+	copy(full[secOff:secOff+secSize], secPlain)
+
+	sum := sha256.Sum256(full)
+	os.WriteFile("/tmp/cnmt_debug.bin", full, 0644)
+	id := sum[:16]
+	old := strings.TrimSuffix(files[idx].Name, ".nca")
+	fmt.Fprintf(os.Stderr, "  cnmt %s -> %s\n", old[:12], hex.EncodeToString(id)[:12])
+	files[idx].R = bytes.NewReader(full)
+	files[idx].Size = int64(len(full))
+	files[idx].Name = hex.EncodeToString(id) + ".cnmt.nca"
+	return nil
 }
 
 func findProdKeys() string {

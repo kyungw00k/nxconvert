@@ -188,10 +188,16 @@ func TestReencryptNCA(t *testing.T) {
 
 	offsets := []int64{secAOff, secBOff}
 	sizes := []int64{secASize, secBSize}
+	mkIV := func(off int64) []byte {
+		iv := make([]byte, 16)
+		binary.BigEndian.PutUint64(iv[8:], uint64(off)>>4)
+		return iv
+	}
+	ivs := [][]byte{mkIV(secAOff), mkIV(secBOff)}
 
 	var out bytes.Buffer
 	capped := &cappedReader{Reader: bytes.NewReader(in), max: 1 << 20}
-	if err := ReencryptNCA(capped, &out, oldKey, newKey, offsets, sizes); err != nil {
+	if err := ReencryptNCA(capped, &out, oldKey, newKey, ivs, offsets, sizes); err != nil {
 		t.Fatalf("ReencryptNCA: %v", err)
 	}
 	got := out.Bytes()
@@ -234,7 +240,7 @@ func TestReencryptNCA(t *testing.T) {
 
 	// Re-encrypting the output back with the keys swapped restores the input.
 	var back bytes.Buffer
-	if err := ReencryptNCA(bytes.NewReader(got), &back, newKey, oldKey, offsets, sizes); err != nil {
+	if err := ReencryptNCA(bytes.NewReader(got), &back, newKey, oldKey, ivs, offsets, sizes); err != nil {
 		t.Fatalf("inverse ReencryptNCA: %v", err)
 	}
 	if !bytes.Equal(back.Bytes(), in) {
@@ -243,7 +249,7 @@ func TestReencryptNCA(t *testing.T) {
 
 	// Identical keys make the operation an identity copy.
 	var same bytes.Buffer
-	if err := ReencryptNCA(bytes.NewReader(in), &same, oldKey, oldKey, offsets, sizes); err != nil {
+	if err := ReencryptNCA(bytes.NewReader(in), &same, oldKey, oldKey, ivs, offsets, sizes); err != nil {
 		t.Fatalf("identity ReencryptNCA: %v", err)
 	}
 	if !bytes.Equal(same.Bytes(), in) {
@@ -256,25 +262,25 @@ func TestReencryptNCA(t *testing.T) {
 		run  func() error
 	}{
 		{"mismatched lengths", func() error {
-			return ReencryptNCA(bytes.NewReader(in), io.Discard, oldKey, newKey, offsets, sizes[:1])
+			return ReencryptNCA(bytes.NewReader(in), io.Discard, oldKey, newKey, ivs, offsets, sizes[:1])
 		}},
 		{"out of order", func() error {
-			return ReencryptNCA(bytes.NewReader(in), io.Discard, oldKey, newKey, []int64{secBOff, secAOff}, []int64{1, 1})
+			return ReencryptNCA(bytes.NewReader(in), io.Discard, oldKey, newKey, ivs, []int64{secBOff, secAOff}, []int64{1, 1})
 		}},
 		{"overlap", func() error {
-			return ReencryptNCA(bytes.NewReader(in), io.Discard, oldKey, newKey, []int64{secAOff, secAOff + 1}, []int64{0x10, 0x10})
+			return ReencryptNCA(bytes.NewReader(in), io.Discard, oldKey, newKey, ivs, []int64{secAOff, secAOff + 1}, []int64{0x10, 0x10})
 		}},
 		{"short old key", func() error {
-			return ReencryptNCA(bytes.NewReader(in), io.Discard, oldKey[:15], newKey, offsets, sizes)
+			return ReencryptNCA(bytes.NewReader(in), io.Discard, oldKey[:15], newKey, ivs, offsets, sizes)
 		}},
 		{"long new key", func() error {
-			return ReencryptNCA(bytes.NewReader(in), io.Discard, oldKey, append(append([]byte(nil), newKey...), 0), offsets, sizes)
+			return ReencryptNCA(bytes.NewReader(in), io.Discard, oldKey, append(append([]byte(nil), newKey...), 0), ivs, offsets, sizes)
 		}},
 		{"negative size", func() error {
-			return ReencryptNCA(bytes.NewReader(in), io.Discard, oldKey, newKey, []int64{0x10}, []int64{-1})
+			return ReencryptNCA(bytes.NewReader(in), io.Discard, oldKey, newKey, ivs, []int64{0x10}, []int64{-1})
 		}},
 		{"truncated section", func() error {
-			return ReencryptNCA(bytes.NewReader(in[:secAOff+0x100]), io.Discard, oldKey, newKey, offsets, sizes)
+			return ReencryptNCA(bytes.NewReader(in[:secAOff+0x100]), io.Discard, oldKey, newKey, ivs, offsets, sizes)
 		}},
 	}
 	for _, tc := range bad {
@@ -540,6 +546,8 @@ func TestDeadCellsSectionCTR(t *testing.T) {
 	start := int64(binary.LittleEndian.Uint32(cnmt.plain[0x40:]))
 	end := int64(binary.LittleEndian.Uint32(cnmt.plain[0x44:]))
 	secOff, secSize := start*0x200, (int64(end)-start)*0x200
+	cnmtIV := make([]byte, 16)
+	binary.BigEndian.PutUint64(cnmtIV[8:], uint64(secOff)>>4)
 
 	newKey := make([]byte, aes.BlockSize)
 	lcgFill(newKey, 0xDEAD)
@@ -568,7 +576,7 @@ func TestDeadCellsSectionCTR(t *testing.T) {
 
 	nca := read(0, cnmt.size)
 	var out bytes.Buffer
-	if err := ReencryptNCA(bytes.NewReader(nca), &out, sectionKey, newKey, []int64{secOff}, []int64{secSize}); err != nil {
+	if err := ReencryptNCA(bytes.NewReader(nca), &out, sectionKey, newKey, [][]byte{cnmtIV}, []int64{secOff}, []int64{secSize}); err != nil {
 		t.Fatalf("ReencryptNCA on retail bytes: %v", err)
 	}
 	got := out.Bytes()
@@ -592,7 +600,7 @@ func TestDeadCellsSectionCTR(t *testing.T) {
 	}
 
 	var back bytes.Buffer
-	if err := ReencryptNCA(bytes.NewReader(got), &back, newKey, sectionKey, []int64{secOff}, []int64{secSize}); err != nil {
+	if err := ReencryptNCA(bytes.NewReader(got), &back, newKey, sectionKey, [][]byte{cnmtIV}, []int64{secOff}, []int64{secSize}); err != nil {
 		t.Fatalf("inverse ReencryptNCA: %v", err)
 	}
 	if !bytes.Equal(back.Bytes(), nca) {

@@ -290,3 +290,22 @@ func (p *patchedReader) Seek(off int64, whence int) (int64, error) {
 	p.off = abs
 	return abs, nil
 }
+
+// DecryptFSHeader decrypts one 0x200-byte fs_header (section-header
+// superblock) read from NCA offset 0x400+idx*0x200. The XTS data unit
+// number is 2+idx, continuing the sequence after the encrypted header at
+// unit 1 (verified against retail NCAs by the PFS0-anchor test).
+func DecryptFSHeader(raw []byte, idx int, headerKey []byte) ([]byte, error) {
+	if len(raw) != 0x200 {
+		return nil, fmt.Errorf("nxformat: fs header must be 0x200 bytes, got %d", len(raw))
+	}
+	return xtsAES(headerKey, uint64(2+idx), raw, true)
+}
+
+// EncryptFSHeader is the inverse of DecryptFSHeader.
+func EncryptFSHeader(plain []byte, idx int, headerKey []byte) ([]byte, error) {
+	if len(plain) != 0x200 {
+		return nil, fmt.Errorf("nxformat: fs header must be 0x200 bytes, got %d", len(plain))
+	}
+	return xtsAES(headerKey, uint64(2+idx), plain, false)
+}
