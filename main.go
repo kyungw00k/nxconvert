@@ -986,14 +986,17 @@ func nscRemasterNCAs(files []nxformat.NamedReader, keysPath string) error {
 		}
 		kaakName := nxformat.KAAKName(plain[7], plain[6], plain[0x20])
 		kaak := keys[kaakName]
-		if kaak == nil {
-			return fmt.Errorf("%s: %s missing from prod.keys", files[i].Name, kaakName)
+		// A missing generation key only blocks the key-area inspection
+		// (treat the NCA as non-cartridge, mirroring nscb_rust); it is a
+		// hard error later only if a rights-id NCA actually needs it.
+		slot0Zero := false
+		if kaak != nil {
+			ka, err := nxformat.DecryptKeyArea(plain[0x100:0x140], kaak)
+			if err != nil {
+				return fmt.Errorf("%s: key area: %w", files[i].Name, err)
+			}
+			slot0Zero = allZero(ka[0])
 		}
-		ka, err := nxformat.DecryptKeyArea(plain[0x100:0x140], kaak)
-		if err != nil {
-			return fmt.Errorf("%s: key area: %w", files[i].Name, err)
-		}
-		slot0Zero := allZero(ka[0])
 		hadRights := !allZero(plain[0x30:0x40])
 		gen := plain[6]
 		if plain[0x20] > gen {
