@@ -1355,11 +1355,11 @@ func patchHeaderForDump(plain []byte, keys map[string][]byte, tickets map[string
 	// 2) Distribution flag.
 	out[4] = 0x01
 
-	// 3) Bump generation +1 (card dumps carry gen+1 vs CDN source).
+	// 3) Bump generation +1 via cryptoType2 ONLY (+0x20) — the working
+	// card dumps keep cryptoType (+0x06) at its original value (02) and
+	// only raise cryptoType2. Setting +0x06 changes the format indicator
+	// and the console rejects it.
 	newGen := oldGen + 1
-	if out[6] < newGen {
-		out[6] = byte(newGen)
-	}
 	if out[0x20] < newGen {
 		out[0x20] = byte(newGen)
 	}
