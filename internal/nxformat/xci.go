@@ -185,10 +185,10 @@ func TransplantXCI(w io.Writer, template io.ReaderAt, tmplSize int64, files []Na
 	if total > tmplSize || secure.totalSize != root[secureIdx].Size {
 		binary.LittleEndian.PutUint64(hdr[xciLastPageOff:], uint64((total-1)/xciPageSize))
 	}
-	// Card capacity code must cover the new content (thresholds mirror
-	// NSC_BUILDER's getGCsize: >=4GiB -> 0xE0 8GB card, >=2 -> 0xF0,
-	// >=1 -> 0xF8, else 0xFA). The donor's code fits only donor content.
-	hdr[0x10D] = GamecardSizeCode(total)
+	// Preserve the donor's card capacity code (RomSize at +0x0D) — the
+	// card identity must stay consistent with the Certificate and Initial
+	// Data bins. Overwriting it with a size-derived value breaks the
+	// identity chain the MIG validates.
 
 	// Patched root: verbatim except the secure entry's size and hash.
 	rootBuf := make([]byte, rootHeaderSize)
