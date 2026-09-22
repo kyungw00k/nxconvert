@@ -1269,14 +1269,37 @@ func remasterDumpStyle(files []nxformat.NamedReader, keysPath string, donorXCI s
 		if err != nil {
 			return fmt.Errorf("%s: %w", name, err)
 		}
-		// 최종 검증: plain의 keyArea에서 newKey가 나오는지
-		{
-			kaak2 := keys[nxformat.KAAKName(plain[7], plain[6], plain[0x20])]
-			ka2, e2 := nxformat.DecryptKeyArea(plain[0x100:0x140], kaak2)
-			if e2 == nil {
-				verifyKey := ka2[nxformat.NCASectionKeySlot]
-				fmt.Fprintf(os.Stderr, "    PREENC keyAreaKey=%x newKey=%x match=%v\n", verifyKey[:4], newKey[:4], bytes.Equal(verifyKey, newKey))
+		// Section re-encryption: CDN key -> fresh random key. IVs from
+		// fs_headers: reverse(section_ctr) || be64(offset>>4).
+		if !allZero(oldKey) {
+			secs := nxformat.ParseNCASections(plain)
+			type secJob struct {
+				off, size int64
+				iv        []byte
 			}
+			var jobs []secJob
+			for _, sc := range secs {
+				fsRaw := full[0x400+sc.Ordinal*0x200 : 0x600+sc.Ordinal*0x200]
+				fsPlain, err := nxformat.DecryptFSHeader(fsRaw, sc.Ordinal, headerKey)
+				if err != nil {
+					return fmt.Errorf("%s: fs header %d: %w", name, sc.Ordinal, err)
+				}
+				jobs = append(jobs, secJob{sc.Offset, sc.Size, nxformat.SectionIV(fsPlain, sc.Offset)})
+			}
+			sort.Slice(jobs, func(a, b int) bool { return jobs[a].off < jobs[b].off })
+			var offs, sizes []int64
+			var ivs [][]byte
+			for _, j := range jobs {
+				offs = append(offs, j.off)
+				sizes = append(sizes, j.size)
+				ivs = append(ivs, j.iv)
+			}
+			var buf bytes.Buffer
+			buf.Grow(len(full))
+			if err := nxformat.ReencryptNCA(bytes.NewReader(full), &buf, oldKey, newKey, ivs, offs, sizes); err != nil {
+				return fmt.Errorf("%s: reencrypt: %w", name, err)
+			}
+			full = buf.Bytes()
 		}
 		if err := nxformat.EncryptNCAHeader(full, plain, headerKey); err != nil {
 			return fmt.Errorf("%s: %w", name, err)
