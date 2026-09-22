@@ -198,6 +198,7 @@ func convertToXCI(args []string) error {
 	keysFlag := fs.String("keys", "", "prod.keys path (default: standard locations)")
 	migFolderFlag := fs.String("mig-folder", "", "write a MIG-ready game folder here (XCI + FAT32 split + Certificate/Initial Data bins)")
 	migBinsFlag := fs.String("mig-bins", "", "donor card dump (XCI path) whose Certificate/Initial Data bins to copy into --mig-folder")
+	noRemasterFlag := fs.Bool("no-remaster", false, "skip NCA header rewriting (no keys needed; emulator-oriented output)")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: nxconvert to-xci input1.nsp [input2.nsp ...] [-o output.xci]")
 		fmt.Fprintln(os.Stderr, "Run 'nxconvert help' for full usage.")
@@ -274,16 +275,20 @@ func convertToXCI(args []string) error {
 
 	// NSC_BUILDER-style NCA header rewrite for XCI: gamecard-flag logic,
 	// rights-id clearing, and titlekey->key-area slots — the header shape
-	// every MIG-verified NSC conversion carries.
+	// every MIG-verified NSC conversion carries. --no-remaster skips it for
+	// a pure container swap (rights-based NCAs stay untouched; emulators
+	// read the ticket themselves).
 	keysPath := *keysFlag
-	if keysPath == "" {
-		keysPath = findProdKeys()
-	}
-	if keysPath == "" {
-		return fmt.Errorf("to-xci requires prod.keys: pass --keys or place it at ~/.switch/prod.keys")
-	}
-	if err := nscRemasterNCAs(files, keysPath); err != nil {
-		return fmt.Errorf("nsc remaster: %w", err)
+	if !*noRemasterFlag {
+		if keysPath == "" {
+			keysPath = findProdKeys()
+		}
+		if keysPath == "" {
+			return fmt.Errorf("to-xci requires prod.keys (or pass --no-remaster for a pure container swap)")
+		}
+		if err := nscRemasterNCAs(files, keysPath); err != nil {
+			return fmt.Errorf("nsc remaster: %w", err)
+		}
 	}
 
 	// Set up progress tracking
