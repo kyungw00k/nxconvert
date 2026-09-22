@@ -1325,73 +1325,87 @@ func remasterDumpStyle(files []nxformat.NamedReader, keysPath string, donorXCI s
 	return nil
 }
 
-// patchHeaderForDump applies dist/rights/key-area edits to a decrypted
-// 0x200 header region. Returns the patched header and the OLD section key
-// (for section re-encryption) plus the NEW random section key.
+// patchHeaderForDump applies dist/gen/key-area edits to a decrypted
+// 0x200 header region. Order matters: the OLD key area is decrypted under
+// the OLD generation's kaak first, then the generation is bumped +1 (the
+// working card dumps carry gen+1 vs CDN), then the NEW random section key
+// is encrypted under the NEW generation's kaak.
 func patchHeaderForDump(plain []byte, keys map[string][]byte, tickets map[string][]byte) (out []byte, oldKey, newKey []byte, err error) {
 	out = append([]byte(nil), plain...)
-	out[4] = 0x01 // gamecard distribution
 
-	// Bump the master key generation by one — the working card "dumps"
-	// carry gen+1 vs their CDN source (Dead Cells: CDN gen 4 → card gen 5,
-	// the ONLY field difference in an otherwise identical NCA).
-	if out[0x20] > out[6] {
-		out[6] = out[0x20]
+	// 1) Read the OLD generation and decrypt the OLD key area.
+	oldGen := out[6]
+	if out[0x20] > oldGen {
+		oldGen = out[0x20]
 	}
-	if out[0x20] < out[6]+1 {
-		out[0x20] = out[6] + 1
+	oldRev := oldGen
+	if oldRev > 0 {
+		oldRev--
 	}
-	gen := out[6]
-	if out[0x20] > gen {
-		gen = out[0x20]
+	oldKaak := keys[nxformat.KAAKName(out[7], out[6], out[0x20])] // raw header bytes — KAAKName does its own max()-1
+	if oldKaak == nil {
+		return nil, nil, nil, fmt.Errorf("old %s missing", nxformat.KAAKName(out[7], out[6], byte(oldRev)))
 	}
-	rev := gen
-	if rev > 0 {
-		rev--
-	}
-	kaak := keys[nxformat.KAAKName(out[7], out[6], out[0x20])]
-	if kaak == nil {
-		return nil, nil, nil, fmt.Errorf("%s missing", nxformat.KAAKName(out[7], out[6], out[0x20]))
-	}
-	ka, err2 := nxformat.DecryptKeyArea(out[0x100:0x140], kaak)
+	oldKa, err2 := nxformat.DecryptKeyArea(out[0x100:0x140], oldKaak)
 	if err2 != nil {
 		return nil, nil, nil, err2
 	}
-	oldKey = ka[nxformat.NCASectionKeySlot]
-	newKey = make([]byte, 16)
-	rand.Read(newKey)
-	z16 := make([]byte, 16)
-	blob, err2 := nxformat.EncryptKeyArea([][]byte{z16, z16, newKey, z16}, kaak)
-	if err2 != nil {
-		return nil, nil, nil, err2
-	}
-	copy(out[0x100:0x140], blob)
+	oldKey = oldKa[nxformat.NCASectionKeySlot]
 
+	// 2) Distribution flag.
+	out[4] = 0x01
+
+	// 3) Bump generation +1 (card dumps carry gen+1 vs CDN source).
+	newGen := oldGen + 1
+	if out[6] < newGen {
+		out[6] = byte(newGen)
+	}
+	if out[0x20] < newGen {
+		out[0x20] = byte(newGen)
+	}
+	newRev := newGen
+	if newRev > 0 {
+		newRev--
+	}
+
+	// 4) Rights handling.
 	rights := append([]byte(nil), out[0x30:0x40]...)
 	copy(out[0x30:0x40], make([]byte, 16))
+
+	newKaak := keys[nxformat.KAAKName(out[7], out[6], byte(newRev))]
+	if newKaak == nil {
+		return nil, nil, nil, fmt.Errorf("new %s missing", nxformat.KAAKName(out[7], out[6], byte(newRev)))
+	}
+
 	if allZero(rights) {
+		// 5) Non-rights: fresh random section key in {0,0,key,0}.
+		newKey = make([]byte, 16)
+		rand.Read(newKey)
+		z16 := make([]byte, 16)
+		blob, err3 := nxformat.EncryptKeyArea([][]byte{z16, z16, newKey, z16}, newKaak)
+		if err3 != nil {
+			return nil, nil, nil, err3
+		}
+		copy(out[0x100:0x140], blob)
 		return out, oldKey, newKey, nil
 	}
+
+	// Rights-based: decrypt titlekey, fill all four slots.
 	encTK, ok := tickets[hex.EncodeToString(rights)]
 	if !ok {
 		return nil, nil, nil, fmt.Errorf("rights id %x has no ticket in batch", rights)
 	}
-	titlekek := keys[fmt.Sprintf("titlekek_%02d", rev)]
+	titlekek := keys[fmt.Sprintf("titlekek_%02d", oldRev)]
 	if titlekek == nil {
-		return nil, nil, nil, fmt.Errorf("titlekek_%02d missing from prod.keys", rev)
+		return nil, nil, nil, fmt.Errorf("titlekek_%02d missing", oldRev)
 	}
-	tk, err := decryptTitleKey(encTK, titlekek)
-	if err != nil {
-		return nil, nil, nil, err
+	tk, err4 := decryptTitleKey(encTK, titlekek)
+	if err4 != nil {
+		return nil, nil, nil, err4
 	}
-	kaak2 := keys[nxformat.KAAKName(out[7], out[6], out[0x20])]
-	if kaak2 == nil {
-		return nil, nil, nil, fmt.Errorf("%s missing", nxformat.KAAKName(out[7], out[6], out[0x20]))
-	}
-	// rights 기반: titlekey를 새 키로 사용
-	blob2, err := nxformat.EncryptKeyArea([][]byte{tk, tk, tk, tk}, kaak2)
-	if err != nil {
-		return nil, nil, nil, err
+	blob2, err5 := nxformat.EncryptKeyArea([][]byte{tk, tk, tk, tk}, newKaak)
+	if err5 != nil {
+		return nil, nil, nil, err5
 	}
 	copy(out[0x100:0x140], blob2)
 	return out, oldKey, tk, nil
