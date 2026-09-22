@@ -1510,7 +1510,7 @@ func remasterCnmt(files []nxformat.NamedReader, idx int, keys map[string][]byte,
 	copy(full[0x400:0x600], newFs)
 	secHash := sha256.Sum256(fsPlain)
 	copy(plain[0x80:0xA0], secHash[:])
-	plain, _, _, err = patchHeaderForDump(plain, keys, map[string][]byte{})
+	plain, _, cnmtNewKey, err := patchHeaderForDump(plain, keys, map[string][]byte{})
 	if err != nil {
 		return err
 	}
@@ -1518,8 +1518,13 @@ func remasterCnmt(files []nxformat.NamedReader, idx int, keys map[string][]byte,
 		return err
 	}
 
-	// Re-encrypt section.
-	cipher.NewCTR(block, iv).XORKeyStream(secPlain, secPlain)
+	// Re-encrypt section with the NEW key from patchHeaderForDump —
+	// using the old key here meant the console couldn't decrypt the cnmt.
+	cnmtBlock, err2 := aes.NewCipher(cnmtNewKey)
+	if err2 != nil {
+		return err2
+	}
+	cipher.NewCTR(cnmtBlock, iv).XORKeyStream(secPlain, secPlain)
 	copy(full[secOff:secOff+secSize], secPlain)
 
 	sum := sha256.Sum256(full)
